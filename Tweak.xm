@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.27";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.28";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -98,6 +98,11 @@ static const NSTimeInterval RSCaptureStopGrace = 1.35;
 static BOOL RSEyeGracePaused = NO;
 // V7.11.9.4.3.2.6.26：暂停隐藏的延时取消代次（点一下灵动岛再点空白不会闪）
 static NSUInteger RSPauseEyeGeneration = 0;
+// V7.11.9.4.3.2.6.28：恢复显示门 —— 几何稳定后才点亮，避免“先亮再跳”
+static BOOL RSIslandShowGate = NO;
+static NSTimeInterval RSIslandShowDeadline = 0;
+static NSUInteger RSIslandGateHits = 0;
+static CGPoint RSIslandGateCenter = {0, 0};
 // v5.7.19：APP/Live Activity 场景从右侧独立圆结束录屏时，系统会在真正停止后的尾声
 // 短暂把 isCaptured 再抖回 YES。旧版会立刻把 eye 重新显示，形成“右圆结束 -> 长条红点/写轮眼
 // 又转一下 -> 再暂停”的视觉回弹。恢复录屏改为“持续 YES 确认”后才显示。
@@ -549,9 +554,17 @@ static void RSResumeEyeAfterCaptureGrace(void) {
     RSRestoreTransientRedLeaves();
     if (container) RSHideContainer(container);
     RSSuppressTransientRecordingRedContainers();
+    // V7.11.9.4.3.2.6.28：恢复时不要“先亮再纠偏”。
+    // 用户实测：暂停→点空白，素材会先在最旧位置闪一下再跳到正确位置。
+    // 现在改成“几何稳定后才显示”：最多等 0.20s，一旦连续两次同步位置一致就点亮；
+    // 到点即使没稳定也显示（不会永久不出现）。
+    RSIslandShowGate = YES;
+    RSIslandShowDeadline = now + 0.20;
+    RSIslandGateHits = 0;
+    RSIslandGateCenter = CGPointZero;
     eye.alpha = 1.0;
-    eye.hidden = NO;
-    RSLog(@"[V7.11.8.4] eye shown immediately after capture resume confirmation sameIdentity=%d", sameIdentity);
+    eye.hidden = YES;
+    RSLog(@"[V7.11.9.4.3.2.6.28] eye show gated until geometry stable sameIdentity=%d", sameIdentity);
 
     // 若宿主随后被系统替换，既有 refresh/remount 链负责重挂载；这里额外保留一次
     // 非阻塞式几何校正，不再把 eye 隐藏等待。
@@ -561,6 +574,21 @@ static void RSResumeEyeAfterCaptureGrace(void) {
         UIView *c = RSInstalledContainer;
         if (c) RSHideContainer(c);
         RSSuppressTransientRecordingRedContainers();
+    });
+
+    // V7.11.9.4.3.2.6.28：显示门兜底 —— 万一药丸分支没跑到（宿主还没就绪），
+    // 到点也必须把素材放出来，绝不能因为门一直关着而永久不显示。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.26 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!RSIslandShowGate) return;
+        RSIslandShowGate = NO;
+        if (!RSRecordingActive || RSCaptureStopPending || !RSSharinganView) return;
+        RSUpdateEyeGeometry();
+        UIImageView *e2 = RSSharinganView;
+        if (e2 && !RSEyeGracePaused && !RSEyeResumeVisibilityPending) {
+            e2.alpha = 1.0;
+            e2.hidden = NO;
+            RSLog(@"[V7.11.9.4.3.2.6.28] eye shown by gate fallback");
+        }
     });
 }
 
@@ -1725,14 +1753,42 @@ static void RSIslandRoundAccessoryHost(UIView *host) {
 // 之前素材挂在 22x22 的 accessory portal 里，portal 太小，会把 37pt 的圆形素材
 // 上下切成平边（用户看到的“缺角/被挖掉一块”就是这么来的 —— 实测红色区域 y 只有 68px=30.2pt，
 // 而设置尺寸是 36.99pt）。药丸容器高度 36.67pt，素材挂进去就能完整显示、还能严格贴边。
+// V7.11.9.4.3.2.6.28：稳定选择药丸容器。
+// 6.27 只按“交集面积最大”挑，会挑到音乐展开时那个 407x84 的大容器，
+// 素材圆心按 h/2 算就跑到左边中部 → 用户看到“闪一下/乱跳”。
+// 新规则：
+//   尺寸带收窄（宽 40~260、高 24~50，排除展开的大容器）；
+//   先比交集比例，再比面积（小的优先，即“紧贴元素的那个”）；
+//   如果上一次用的药丸仍然可用，直接沿用（迟滞，避免切程序时来回跳）。
+static __weak UIView *RSIslandStickyPill = nil;
+
+static BOOL RSIslandPillUsable(UIView *v, UIView *element) {
+    if (!v || !v.window || v.hidden || v.alpha <= 0.01) return NO;
+    if (!element || !element.window) return NO;
+    CGRect cr = [v convertRect:v.bounds toView:element.window];
+    CGRect er = [element convertRect:element.bounds toView:element.window];
+    if (CGRectIsEmpty(cr) || CGRectIsEmpty(er)) return NO;
+    CGFloat cw = CGRectGetWidth(cr), ch = CGRectGetHeight(cr);
+    if (cw < 40.0 || cw > 260.0 || ch < 24.0 || ch > 50.0) return NO;
+    CGRect pad = CGRectInset(er, -46.0, -12.0);
+    CGRect inter = CGRectIntersection(pad, cr);
+    if (CGRectIsNull(inter)) return NO;
+    return ((CGRectGetWidth(inter) * CGRectGetHeight(inter)) / MAX(cw * ch, 1.0)) >= 0.5;
+}
+
 static UIView *RSIslandRecordingContainerForElement(UIView *element) {
     if (!element || !element.window) return nil;
     UIWindow *win = element.window;
     CGRect er = [element convertRect:element.bounds toView:win];
     if (CGRectIsEmpty(er)) return nil;
+
+    // 迟滞：上一次的药丸还可用就继续用，避免切换程序时在两个候选间跳。
+    UIView *sticky = RSIslandStickyPill;
+    if (sticky && RSIslandPillUsable(sticky, element)) return sticky;
+
     CGRect pad = CGRectInset(er, -46.0, -12.0);
     UIView *best = nil;
-    CGFloat bestArea = 0.0;
+    CGFloat bestRatio = 0.0, bestArea = CGFLOAT_MAX;
     for (UIWindow *w in RSAllApplicationWindows()) {
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
         NSInteger guard = 0;
@@ -1743,19 +1799,23 @@ static UIView *RSIslandRecordingContainerForElement(UIView *element) {
                 v.window && !v.hidden && v.alpha > 0.01) {
                 CGRect cr = [v convertRect:v.bounds toView:win];
                 CGFloat cw = CGRectGetWidth(cr), ch = CGRectGetHeight(cr);
-                if (!CGRectIsEmpty(cr) && cw >= 40.0 && cw <= 420.0 && ch >= 18.0 && ch <= 160.0) {
+                if (!CGRectIsEmpty(cr) && cw >= 40.0 && cw <= 260.0 && ch >= 24.0 && ch <= 50.0) {
                     CGRect inter = CGRectIntersection(pad, cr);
                     if (!CGRectIsNull(inter)) {
-                        CGFloat ratio = (CGRectGetWidth(inter) * CGRectGetHeight(inter)) /
-                                        MAX(cw * ch, 1.0);
-                        CGFloat area = CGRectGetWidth(inter) * CGRectGetHeight(inter);
-                        if (ratio >= 0.5 && area > bestArea) { bestArea = area; best = v; }
+                        CGFloat iw = CGRectGetWidth(inter), ih = CGRectGetHeight(inter);
+                        CGFloat ratio = (iw * ih) / MAX(cw * ch, 1.0);
+                        CGFloat area = iw * ih;
+                        if (ratio >= 0.5 && (ratio > bestRatio + 0.02 ||
+                                             (fabs(ratio - bestRatio) <= 0.02 && area < bestArea))) {
+                            bestRatio = ratio; bestArea = area; best = v;
+                        }
                     }
                 }
             }
             for (UIView *sub in v.subviews) [stack addObject:sub];
         }
     }
+    if (best) RSIslandStickyPill = best;
     return best;
 }
 
@@ -1812,7 +1872,31 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
                           right ? @"right" : @"left", NSStringFromCGRect(pill.bounds), side);
                 }
             }
-            if (allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending &&
+            // V7.11.9.4.3.2.6.28：药丸分支原来直接 return，6.27 把素材搬到药丸后
+            // 右侧独立小岛的圆角处理被跳过了 —— 用户看到“右边又不圆了”。这里补上。
+            RSIslandRoundAccessoryHost(pill);
+
+            // V7.11.9.4.3.2.6.28：显示门判定 —— 连续两次落在同一位置才点亮，或到点强制点亮。
+            // 这是“点空白后素材闪一下”的修法：宁晚 0.1 秒，也不在旧位置闪。
+            BOOL gateDone = YES;
+            if (RSIslandShowGate) {
+                NSTimeInterval gateNow = CACurrentMediaTime();
+                CGFloat gd = hypot(c.x - RSIslandGateCenter.x, c.y - RSIslandGateCenter.y);
+                if (gd <= 1.0) {
+                    RSIslandGateHits++;
+                } else {
+                    RSIslandGateHits = 1;
+                    RSIslandGateCenter = c;
+                }
+                gateDone = (RSIslandGateHits >= 2) || (gateNow > RSIslandShowDeadline);
+                if (gateDone) {
+                    RSIslandShowGate = NO;
+                    RSLog(@"[V7.11.9.4.3.2.6.28] eye shown after geometry gate hits=%lu center={%.2f,%.2f}",
+                          (unsigned long)RSIslandGateHits, c.x, c.y);
+                }
+            }
+
+            if (allowShow && gateDone && !RSEyeGracePaused && !RSEyeResumeVisibilityPending &&
                 !RSRightTransitionSuppressed) {
                 if (eye.hidden) eye.hidden = NO;
                 if (eye.alpha < 0.01) eye.alpha = 1.0;

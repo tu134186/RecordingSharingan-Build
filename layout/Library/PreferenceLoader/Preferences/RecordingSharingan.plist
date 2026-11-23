@@ -12,6 +12,8 @@
 		<string>RSRootController</string>
 		<key>label</key>
 		<string>录屏写轮眼</string>
+		<key>icon</key>
+		<string>RecordingSharingan</string>
 		<key>isController</key>
 		<true/>
 	</dict>

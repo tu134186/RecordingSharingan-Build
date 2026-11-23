@@ -1,6 +1,6 @@
-# RecordingSharingan 6.27
+# RecordingSharingan 6.28
 
-Material moved into the pill container (flush edge, no clipped corner);
-native dot ownership check so it cannot jump to another Live Activity.
+Settings icon; resume show-gate (no flash); sticky pill selection (no jumping);
+chip rounding restored for the separated right island.
 
-See FIX-6.27.md.
+See FIX-6.28.md.
