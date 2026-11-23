@@ -1614,7 +1614,7 @@ static void RSIslandSafeRound(UIView *v, NSString *why) {
         NSString *cls = NSStringFromClass(v.class);
         CGRect b = v.bounds;
         dispatch_async(dispatch_get_main_queue(), ^{
-            RSLog(@"[V7.11.9.4.3.2.6.24] chip rounded (%@) class=%@ bounds=%@ radius=%.1f",
+            RSLog(@"[V7.11.9.4.3.2.6.25] chip rounded (%@) class=%@ bounds=%@ radius=%.1f",
                   why ?: @"-", cls, NSStringFromCGRect(b), radius);
         });
     }
@@ -1624,7 +1624,7 @@ static void RSIslandProbeAccessoryChain(UIView *host) {
     if (RSIslandProbedAccessory || !host) return;
     RSIslandProbedAccessory = YES;
     @try {
-        NSMutableString *out = [NSMutableString stringWithString:@"\n[V7.11.9.4.3.2.6.24] ===== accessory tree probe =====\n"];
+        NSMutableString *out = [NSMutableString stringWithString:@"\n[V7.11.9.4.3.2.6.25] ===== accessory tree probe =====\n"];
         UIView *outer = host;
         for (int up = 0; up < 5 && outer; up++) {
             [out appendFormat:@"  up%d %@ frame=%@ r=%.1f mask=%d dark=%d\n",
@@ -3354,7 +3354,7 @@ static BOOL RSIslandExtendLeftFrame(UIView *container, CGRect frame, CGRect *out
                 RSIslandLastExtendLog = now_; \
                 CGRect nat_ = frame; CGRect ext2_ = ext_; \
                 dispatch_async(dispatch_get_main_queue(), ^{ \
-                    RSLog(@"[V7.11.9.4.3.2.6.24] island %@ left=%.1f baseline=%.1f %@ -> %@", \
+                    RSLog(@"[V7.11.9.4.3.2.6.25] island %@ left=%.1f baseline=%.1f %@ -> %@", \
                           why, extra, (double)(bw), NSStringFromCGRect(nat_), NSStringFromCGRect(ext2_)); \
                 }); \
             } \
