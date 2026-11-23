@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.30";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.31";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -1881,6 +1881,102 @@ static UIView *RSIslandRecordingContainerForElement(UIView *element) {
 }
 
 // ===================================================================
+// V7.11.9.4.3.2.6.31 —— 素材必须挂在“药丸容器”上，不能挂在 accessory portal 里
+// 6.30 的实机录屏（46s）证据：
+//   · 单独录屏：素材正常（走的是药丸分支）；
+//   · 开音乐 / 开地图后：岛右端只剩一道**红色月牙**（c003 帧），其余被黑色背板盖住
+//     —— 因为素材被挂进了 `SBSystemApertureSceneElementAccessoryPortalView`（17x22），
+//        z 序在黑背板之下，只有伸出药丸圆角外的那一小条能被看见 → 用户说“不是圆的”；
+//   · 切左素材：RSReloadEyeImage 重建视图，portal 身份失效 → 素材直接不见。
+// 结论：位置可以照抄 portal/红点，但**父视图必须是药丸容器**，并且每次布局都 bringToFront。
+// ===================================================================
+
+static UIView *RSV631EnclosingPill(UIView *v) {
+    UIView *cur = v;
+    for (NSInteger i = 0; i < 12 && cur; i++, cur = cur.superview) {
+        if ([NSStringFromClass(cur.class) isEqualToString:@"SBSystemApertureContainerView"] &&
+            cur.window && !cur.hidden && cur.alpha > 0.01) return cur;
+    }
+    return nil;
+}
+
+// 统一摆放：anchor 只提供“红点在哪儿”，pill 提供父视图与尺寸
+static void RSV631LogMissingPill(NSString *site, UIView *v) {
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - last < 2.0) return;
+    last = now;
+    NSMutableString *chain = [NSMutableString string];
+    UIView *cur = v;
+    for (NSInteger i = 0; i < 8 && cur; i++, cur = cur.superview)
+        [chain appendFormat:@"%@ < ", NSStringFromClass(cur.class)];
+    RSLog(@"[V7.11.9.4.3.2.6.31] no pill for %@ chain=%@", site, chain);
+}
+
+static BOOL RSV631PlaceEye(UIView *pill, UIView *anchor, BOOL allowShow) {
+    if (!pill || !pill.window) return NO;
+    CGFloat pw = CGRectGetWidth(pill.bounds), ph = CGRectGetHeight(pill.bounds);
+    if (pw < 24.0 || ph < 18.0) return NO;
+    UIImageView *eye = RSEyeViewEnsure();
+    if (!eye) return NO;
+
+    CGRect ar = CGRectZero;
+    @try {
+        if (anchor && anchor.window && anchor.superview)
+            ar = [anchor.superview convertRect:anchor.frame toView:pill];
+    } @catch (...) { ar = CGRectZero; }
+    if (CGRectIsEmpty(ar)) return NO;
+
+    BOOL right = CGRectGetMidX(ar) > (pw / 2.0);
+    CGFloat configured = right ? RSRightSize() : RSLeftSize();
+    CGFloat side = MIN(configured, ph);
+    CGFloat half = side / 2.0;
+
+    if (eye.superview != pill) {
+        [eye removeFromSuperview];
+        [pill addSubview:eye];
+    }
+    [pill bringSubviewToFront:eye];
+    RSApplyMaterialForSide(eye, right);
+
+    CGPoint c = CGPointMake(CGRectGetMidX(ar), CGRectGetMidY(ar));
+    c.x += right ? RSRightXOffset() : RSLeftXOffset();
+    c.y += RSYOffset();
+    c.x = MAX(half, MIN(pw - half, c.x));
+    c.y = MAX(half, MIN(ph - half, c.y));
+
+    [UIView performWithoutAnimation:^{
+        eye.bounds = CGRectMake(0, 0, side, side);
+        eye.center = c;
+    }];
+    eye.layer.cornerRadius = 0.0;
+    eye.clipsToBounds = NO;
+    eye.layer.masksToBounds = NO;
+    if (![eye.layer animationForKey:@"rs.rotation"]) RSStartRotation(eye);
+    if (allowShow || !RSEyeResumeVisibilityPending) {
+        if (eye.hidden) eye.hidden = NO;
+        if (eye.alpha < 0.01) eye.alpha = 1.0;
+    }
+
+    RSEyeHostElement = pill;
+    RSEyeGeometryRight = right;
+    RSEyeGeometryHasSide = YES;
+    RSIslandStickyPill = pill;
+
+    static NSTimeInterval lastLog = 0;
+    static __weak UIView *lastPill = nil;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (lastPill != pill || now - lastLog > 2.0) {
+        lastPill = pill;
+        lastLog = now;
+        RSLog(@"[V7.11.9.4.3.2.6.31] eye on pill anchor=%@ pill=%@ center={%.2f,%.2f} size=%.2f side=%@",
+              NSStringFromClass(anchor.class), NSStringFromCGRect(pill.bounds),
+              c.x, c.y, side, right ? @"right" : @"left");
+    }
+    return YES;
+}
+
+// ===================================================================
 // V7.11.9.4.3.2.6.30 —— 完全照抄系统红点（用户给的比喻：素材只是脸谱）
 // 6.29 实机日志 + 录屏（55s）证明：
 //   1) 屏幕右侧 x≈415 还有一个“离屏副本”SBRecordingIndicatorView，6.29 一直把
@@ -2023,6 +2119,20 @@ static BOOL RSV630PlaceEyeOnPill(UIView *pill, BOOL allowShow) {
     UIView *hideTarget = nil;
     UIView *anchor = RSV630DotAnchorInContainer(pill, &hideTarget);
     if (!anchor) return NO;                 // 只接管“红点确实在这块岛里”的容器
+    // V7.11.9.4.3.2.6.31：统一交给 RSV631PlaceEye（父视图=药丸，bringToFront）
+    if (RSV631PlaceEye(pill, anchor, allowShow)) {
+        if (hideTarget) {
+            if (RSNativeRecordingIndicatorView && RSNativeRecordingIndicatorView != hideTarget) {
+                RSV73RestoreNativeIndicator();
+            }
+            if (RSHideNativeRedEnabled()) {
+                RSV73HideNativeIndicator(hideTarget);
+                RSNativeRecordingIndicatorView = hideTarget;
+                RSNativeIndicatorHost = hideTarget.superview;
+            }
+        }
+        return YES;
+    }
 
     UIImageView *eye = RSEyeViewEnsure();
     if (!eye) return NO;
@@ -2140,9 +2250,15 @@ static void RSV630SchedulePlaceFromContainer(UIView *v) {
     if (!v || !v.window || !RSRecordingActive || RSCaptureStopPending || !RSIsEnabled()) return;
     CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
     if (w < 40.0 || w > 300.0 || h < 24.0 || h > 50.0) return;
-    UIView *hide = nil;
-    UIView *anchor = RSV630DotAnchorInContainer(v, &hide);
-    if (!anchor) return;
+    // V7.11.9.4.3.2.6.31：除了“红点在这块岛里”，只要素材当前挂在这块岛上，也要重贴一次
+    // （系统重建背板/换 frame 后不会被盖到下面，切素材后也不会消失）。
+    BOOL ownsEye = (RSSharinganView && RSSharinganView.superview == v);
+    if (!ownsEye) ownsEye = (RSIslandStickyPill == v);
+    if (!ownsEye) {
+        UIView *hide = nil;
+        UIView *anchor = RSV630DotAnchorInContainer(v, &hide);
+        if (!anchor) return;
+    }
     RSV630PendingPill = v;
     if (RSV630PlaceScheduled) return;
     RSV630PlaceScheduled = YES;
@@ -2316,6 +2432,14 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     }
     if (portal && portal.window) {
         RSV711AccessoryPortal = portal;
+        // V7.11.9.4.3.2.6.31：portal 只用来定位，父视图换成药丸容器，
+        // 否则素材在黑背板下面，只会露出圆角外的红色月牙。
+        UIView *ownerPill = RSV631EnclosingPill(portal);
+        if (!ownerPill) RSV631LogMissingPill(@"accessory-portal", portal);
+        if (ownerPill && RSV631PlaceEye(ownerPill, portal, allowShow)) {
+            RSIslandRoundAccessoryHost(ownerPill);
+            return;
+        }
         UIView *host = portal; // keep coordinates local to the 22x22 presentation leaf
         if (eye.superview != host) { [eye removeFromSuperview]; [host addSubview:eye]; }
         [host bringSubviewToFront:eye];
@@ -2343,6 +2467,10 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     // 一旦 Hook 捕获真实 9x9 红点，下一轮 sync 会自动把 eye 搬到红点同一 superview。
     UIView *fallback = RSV6AnchorContainerForElement(element);
     if (fallback && fallback.window) {
+        // V7.11.9.4.3.2.6.31：fallback 也优先挂药丸容器（以 provided 容器center为锚点）。
+        UIView *fbPill = RSV631EnclosingPill(fallback);
+        if (!fbPill) RSV631LogMissingPill(@"fallback-anchor", fallback);
+        if (fbPill && RSV631PlaceEye(fbPill, fallback, allowShow)) return;
         if (eye.superview != fallback) {
             [eye removeFromSuperview];
             [fallback addSubview:eye];
@@ -2895,6 +3023,14 @@ static void RSReloadEyeImage(void) {
     if(!eye)return;
     RSApplyMaterialForSide(eye,RSMaterialHasSide ? RSMaterialCurrentSide : RSLastWasRight);
     RSStartRotation(eye);
+    // V7.11.9.4.3.2.6.31：切素材后立刻重贴一次（用户反馈“切左边素材会消失”）。
+    @try {
+        if (!RSV630TryDotPlacement() && RSV711AccessoryPortal) {
+            UIView *pill = RSV631EnclosingPill(RSV711AccessoryPortal);
+            if (pill) RSV631PlaceEye(pill, RSV711AccessoryPortal, YES);
+        }
+    } @catch (...) {}
+    RS20ScheduleRefresh();
 }
 
 static void RSDiscoverAllBody(BOOL forceRescan) {
