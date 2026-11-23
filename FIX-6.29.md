@@ -93,3 +93,17 @@ Mach-O 解析结果（arm64 slice，__objc_methname 238 条）：
 本机无 macOS / Xcode / iPhoneOS SDK，无法编译或实机验证：
 Logos 预处理零错误、括号 642/642、无未使用函数、零 `masksToBounds`。
 `.deb` 由 GitHub Actions 的 macOS runner 生成。实机效果需安装确认。
+## 六、构建修复（6.29 首次真正出货）
+
+前一阶段 6.29 连续 5 次构建失败，日志是：
+
+```
+Tweak.xm:103:23: error: unused variable 'RSIslandShowDeadline' [-Werror,-Wunused-variable]
+Tweak.xm:104:19: error: unused variable 'RSIslandGateHits'
+Tweak.xm:105:16: error: unused variable 'RSIslandGateCenter'
+```
+
+删掉显示门时只删了逻辑、忘了删这三个静态变量（Theos 编译带 `-Werror`）。
+删除后本地扫描确认 282 个 static 符号无未使用项，重新构建成功：
+
+- run 45209952482，deb 253006 字节，sha256 80d0dbcdc41768d1…
