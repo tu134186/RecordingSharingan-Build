@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.25";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.26";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -96,6 +96,8 @@ static NSUInteger RSCaptureStopGeneration = 0;
 static const NSTimeInterval RSCaptureStopGrace = 1.35;
 // v5.7.16：grace 期间保留同一个 UIImageView，但冻结旋转并隐藏；恢复时原相位继续。
 static BOOL RSEyeGracePaused = NO;
+// V7.11.9.4.3.2.6.26：暂停隐藏的延时取消代次（点一下灵动岛再点空白不会闪）
+static NSUInteger RSPauseEyeGeneration = 0;
 // v5.7.19：APP/Live Activity 场景从右侧独立圆结束录屏时，系统会在真正停止后的尾声
 // 短暂把 isCaptured 再抖回 YES。旧版会立刻把 eye 重新显示，形成“右圆结束 -> 长条红点/写轮眼
 // 又转一下 -> 再暂停”的视觉回弹。恢复录屏改为“持续 YES 确认”后才显示。
@@ -1602,6 +1604,9 @@ static BOOL RSIslandViewIsFragile(UIView *v) {
 // 只设圆角，绝不开 masksToBounds。
 static void RSIslandSafeRound(UIView *v, NSString *why) {
     if (!v || !v.window) return;
+    // V7.11.9.4.3.2.6.26：别把圆角加在我们自己的写轮眼素材上（日志里出现过
+    // "chip rounded (grandchild) class=UIImageView bounds={36.99,36.99} radius=18.5"）。
+    if (v == (UIView *)RSSharinganView) return;
     if (RSIslandViewIsFragile(v)) return;
     CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
     if (w < 28.0 || w > 70.0 || h < 24.0 || h > 70.0) return;
@@ -1767,21 +1772,22 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     }
     if (!portal) portal = RSV711BestAccessoryHostForElement(element);
     // V7.11.9.4.3.2.6.25：最后一道保险 —— 选出来的宿主必须真的在录屏元素附近。
-    // 屏幕上出现其它 Live Activity（地图、音乐等）时，曾经把最右边那块岛当成录屏宿主，
-    // 素材就贴着屏幕右边缘显示。这里用元素中心做距离上限，超了就当作没有可用宿主。
+    // V7.11.9.4.3.2.6.26：改用“矩形间隙”而不是中心距 —— 录屏元素视图实测是整宽视图
+    // （中心≈306），而红点在 x≈143，用中心距会把**正确**的宿主也判成“别的活动”
+    // （日志里就是 d={-162.5,0.0}），于是素材掉回 provided container 里。
     if (portal && portal.window) {
         CGRect er = [element convertRect:element.bounds toView:portal.window];
         CGRect hr = [portal convertRect:portal.bounds toView:portal.window];
         if (!CGRectIsEmpty(er) && !CGRectIsEmpty(hr)) {
-            CGFloat dx = CGRectGetMidX(hr) - CGRectGetMidX(er);
-            CGFloat dy = CGRectGetMidY(hr) - CGRectGetMidY(er);
-            if (hypot(dx, dy) > 150.0) {
+            CGFloat gapX = MAX(0.0, MAX(er.origin.x - CGRectGetMaxX(hr), hr.origin.x - CGRectGetMaxX(er)));
+            CGFloat gapY = MAX(0.0, MAX(er.origin.y - CGRectGetMaxY(hr), hr.origin.y - CGRectGetMaxY(er)));
+            if (gapX > 60.0 || gapY > 40.0) {
                 static NSTimeInterval lastFarLog = 0;
                 NSTimeInterval now = CACurrentMediaTime();
                 if (now - lastFarLog > 1.0) {
                     lastFarLog = now;
-                    RSLog(@"[V7.11.9.4.3.2.6.25] reject far host class=%@ d={%.1f,%.1f} (likely another Live Activity)",
-                          NSStringFromClass(portal.class), dx, dy);
+                    RSLog(@"[V7.11.9.4.3.2.6.26] reject far host class=%@ gap={%.1f,%.1f} (likely another Live Activity)",
+                          NSStringFromClass(portal.class), gapX, gapY);
                 }
                 portal = nil;
             }
@@ -2723,6 +2729,9 @@ static void RSConfirmCaptureResume(NSUInteger generation) {
     if (!RSCaptureStopPending || !RSRecordingActive) return;
     if (!RSCaptureResumePending || generation != RSCaptureResumeGeneration) return;
 
+    // V7.11.9.4.3.2.6.26：恢复确认到达时，立刻取消可能还在排队的“延时隐藏”。
+    ++RSPauseEyeGeneration;
+
     BOOL captured = NO;
     @try { captured = [UIScreen mainScreen].isCaptured; }
     @catch (NSException *e) { RSLog(@"UIScreen resume-confirm exception: %@", e); return; }
@@ -2997,12 +3006,26 @@ static void RSUpdateRecordingState(void) {
         RSCaptureStopStartedAt = [NSDate timeIntervalSinceReferenceDate];
         RSCancelCaptureResumeConfirmation();
         NSUInteger generation = ++RSCaptureStopGeneration;
-        RSPauseEyeForCaptureGrace();
-        // v5.7.23：eye 隐藏后继续压住当前容器中的系统红点叶子，
-        // 避免暂停/收起 morph 期间闪出一帧原生红点。
-        RSHideContainer(RSInstalledContainer);
-        RSStopPollTimer();
-        RSStopGeometryDisplayLink();
+        // V7.11.9.4.3.2.6.26：不要立刻隐藏。点一下灵动岛会短暂 capture-off，
+        // 紧接着点空白就恢复；立刻隐藏再显示，肉眼就是“素材要 1~2 秒才回来”。
+        // 这里先挂 0.18s，期间如果恢复就被取消，完全不会闪。
+        NSUInteger pauseGen = ++RSPauseEyeGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (pauseGen != RSPauseEyeGeneration) return;
+            if (!RSCaptureStopPending || !RSRecordingActive) return;
+            RSLog(@"capture-off still pending after 0.18s -> hide eye now");
+            RSPauseEyeForCaptureGrace();
+            if (RSInstalledContainer) RSHideContainer(RSInstalledContainer);
+            RSStopPollTimer();
+            RSStopGeometryDisplayLink();
+        });
+        // 恢复检测提速：0.5s 的状态复核太慢，这里在宽限期内每 0.1s 复核一次。
+        for (int i = 1; i <= 12; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (!RSCaptureStopPending || !RSRecordingActive) return;
+                @try { RSUpdateRecordingState(); } @catch (...) {}
+            });
+        }
         RSLog(@"capture-off grace started %.2fs (session preserved, eye hidden/paused, drivers suspended)", RSCaptureStopGrace);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RSCaptureStopGrace * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             RSFinalizeRecordingStop(generation);
@@ -3336,58 +3359,59 @@ static BOOL RSIslandExtendLeftFrame(UIView *container, CGRect frame, CGRect *out
         // 只处理灵动岛量级的宿主；弹窗、全屏宿主、1pt 过渡态一律不碰。
         if (w < 24.0 || w > 420.0 || h < 18.0 || h > 160.0) return NO;
 
-        CGRect baselineRect = RSIslandRecordedFrame(container);
-        CGFloat baseline = CGRectIsNull(baselineRect) ? -1.0 : CGRectGetWidth(baselineRect);
-        BOOL haveBaseline = (baseline > 0.0);
+        // V7.11.9.4.3.2.6.26：只加宽“录屏岛自己的容器”，不再对所有 SBSystemApertureContainerView
+        // 一律 +7 —— 否则旁边音乐/地图那个容器也会被推歪。
+        // 判据：容器与录屏元素在同一个 window 里的矩形要基本重合（元素矩形向外放 46pt 容差，
+        // 且容器至少一半落在里面）。录屏元素未知时一律不动（宁可先不加宽）。
+        UIView *element = RSEyeMountedElement;
+        if (!element || !element.window) return NO;
+        UIWindow *win = container.window;
+        if (!win) return NO;
+        CGRect cr = [container convertRect:container.bounds toView:win];
+        CGRect er = [element convertRect:element.bounds toView:win];
+        if (CGRectIsEmpty(cr) || CGRectIsEmpty(er)) return NO;
+        CGRect pad = CGRectInset(er, -46.0, -12.0);
+        CGRect inter = CGRectIntersection(pad, cr);
+        if (CGRectIsNull(inter)) return NO;
+        CGFloat ca = MAX(CGRectGetWidth(cr) * CGRectGetHeight(cr), 1.0);
+        if ((CGRectGetWidth(inter) * CGRectGetHeight(inter)) / ca < 0.5) return NO;
 
-        // 目标宽度恒等于 baseline + extra：数学上不可能累积。
-        // 右边缘不动：newX = MaxX - targetWidth。
-        #define RS_ISLAND_TARGET(bw) ((bw) + extra)
-        #define RS_ISLAND_APPLY(bw, why) do { \
-            CGFloat tw_ = RS_ISLAND_TARGET(bw); \
-            CGFloat right_ = CGRectGetMaxX(frame); \
-            CGRect ext_ = CGRectMake(right_ - tw_, frame.origin.y, tw_, CGRectGetHeight(frame)); \
-            *outFrame = ext_; \
-            changed = YES; \
-            NSTimeInterval now_ = CACurrentMediaTime(); \
-            if (now_ - RSIslandLastExtendLog > 0.5) { \
-                RSIslandLastExtendLog = now_; \
-                CGRect nat_ = frame; CGRect ext2_ = ext_; \
-                dispatch_async(dispatch_get_main_queue(), ^{ \
-                    RSLog(@"[V7.11.9.4.3.2.6.25] island %@ left=%.1f baseline=%.1f %@ -> %@", \
-                          why, extra, (double)(bw), NSStringFromCGRect(nat_), NSStringFromCGRect(ext2_)); \
-                }); \
-            } \
-        } while (0)
+        // V7.11.9.4.3.2.6.26：判定规则简化成“上一次输出宽度”。
+        // 实测日志证明系统每次 setFrame 给的都是它自己的原生宽度（129.33 / 125.33 / 172 …），
+        // 而 6.25 的“基线 + 动画门控”会在岛动画期间一直放行，导致从来没真正加宽（用户看到左边没变）。
+        // 新规则只有两种结果，单调且不可能累积：
+        //   来帧宽度 ≈ 我们上次输出的宽度  -> 这是系统回灌我们的结果，直接放行；
+        //   其它                          -> 视为原生宽度，输出 = 来帧 + extra（右边缘不动）。
+        NSValue *lastVal = RSIslandBaselines ? [RSIslandBaselines objectForKey:container] : nil;
+        CGFloat lastOut = lastVal ? lastVal.CGSizeValue.width : -1.0;
 
-        if (!haveBaseline) {
-            RSIslandRememberFrame(container, frame);
-            RS_ISLAND_APPLY(w, @"extend");
-            return YES;
+        if (lastOut > 0.0 && fabs(w - lastOut) <= 0.6) {
+            // 已经是我们加宽后的宽度：放行，并把记录对齐到这次的宽度（吸收浮点误差）。
+            if (!RSIslandBaselines) RSIslandBaselines = [NSMapTable weakToStrongObjectsMapTable];
+            [RSIslandBaselines setObject:[NSValue valueWithCGSize:frame.size] forKey:container];
+            return NO;
         }
 
-        CGFloat delta = w - baseline;
-        if (fabs(delta) <= 0.35) {
-            RS_ISLAND_APPLY(baseline, @"re-apply");   // 系统又算了原生宽度
-            return YES;
-        }
-        if (fabs(delta - extra) <= 0.35) {
-            return NO;                                 // 已经是加宽后的宽度
-        }
-        if (delta > 0.0 && delta < extra - 0.35) {
-            return NO;                                 // 系统自己的宽度动画中间帧
-        }
+        CGFloat targetW = w + extra;
+        CGFloat right = CGRectGetMaxX(frame);
+        CGRect ext = CGRectMake(right - targetW, frame.origin.y, targetW, h);
+        if (!RSIslandBaselines) RSIslandBaselines = [NSMapTable weakToStrongObjectsMapTable];
+        [RSIslandBaselines setObject:[NSValue valueWithCGSize:ext.size] forKey:container];
+        *outFrame = ext;
+        changed = YES;
 
-        BOOL animating = NO;
-        @try { animating = RSContainerGeometryIsAnimating(container); } @catch (...) { animating = NO; }
-        if (animating) return NO;                      // 动画中不确立新基线
-
-        RSIslandRememberFrame(container, frame);
-        RS_ISLAND_APPLY(w, @"new-geometry");
+        NSTimeInterval now_ = CACurrentMediaTime();
+        if (now_ - RSIslandLastExtendLog > 0.35) {
+            RSIslandLastExtendLog = now_;
+            CGRect nat_ = frame;
+            CGRect ext2_ = ext;
+            CGFloat prev = lastOut;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                RSLog(@"[V7.11.9.4.3.2.6.26] island extend +%.1f lastOut=%.1f %@ -> %@",
+                      extra, (double)prev, NSStringFromCGRect(nat_), NSStringFromCGRect(ext2_));
+            });
+        }
         return YES;
-
-        #undef RS_ISLAND_APPLY
-        #undef RS_ISLAND_TARGET
     } @catch (NSException *e) {
         // 绝不把异常抛回布局事务（那会直接掀掉 SpringBoard）。
         changed = NO;

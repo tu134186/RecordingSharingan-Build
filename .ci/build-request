@@ -1,1 +1,1 @@
-6.25: host ownership filter, fast resume, layoutIfNeeded widen
+6.26: widen only recording container; no delay on resume

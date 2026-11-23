@@ -1,6 +1,6 @@
-# RecordingSharingan 6.25
+# RecordingSharingan 6.26
 
-Host ownership filtering (material no longer jumps to another Live Activity),
-fast resume (no 1-2s delay), layoutIfNeeded so the left widening always applies.
+Widen only the recording island container (log-driven), gap-based host rejection,
+no hide flicker on pause/resume.
 
-See FIX-6.25.md.
+See FIX-6.26.md.
