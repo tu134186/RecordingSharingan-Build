@@ -1,6 +1,6 @@
-# RecordingSharingan 6.28
+# RecordingSharingan 6.29
 
-Settings icon; resume show-gate (no flash); sticky pill selection (no jumping);
-chip rounding restored for the separated right island.
+Pill located via recording portal (survives app switching); no material hiding on
+capture-off flicker; settings icon at standard 29/58/87.
 
-See FIX-6.28.md.
+See FIX-6.29.md.

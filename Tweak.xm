@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.28";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.29";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -449,24 +449,6 @@ static void RSSuppressNativeRedDuringRightHandoff(NSUInteger generation, NSUInte
     }
 }
 
-static void RSPauseEyeForCaptureGrace(void) {
-    UIImageView *eye = RSSharinganView;
-    if (!eye || RSEyeGracePaused) return;
-    CALayer *layer = eye.layer;
-    CFTimeInterval pausedTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil];
-    layer.speed = 0.0;
-    layer.timeOffset = pausedTime;
-    eye.hidden = YES;
-    eye.alpha = 1.0;
-    RSEyeGracePaused = YES;
-    RSEyeResumeVisibilityPending = NO;
-    RSEyeVisibilityGeneration++;
-    if (RSLastWasRight) {
-        NSUInteger redGeneration = ++RSRedSuppressionGeneration;
-        RSSuppressNativeRedDuringRightHandoff(redGeneration, 0);
-    }
-    RSLog(@"eye hidden + rotation paused for capture-off grace");
-}
 
 static void RSResumeVisibilityCheck(NSUInteger generation, NSTimeInterval startedAt, NSUInteger stableHits) {
     if (generation != RSEyeVisibilityGeneration) return;
@@ -554,17 +536,13 @@ static void RSResumeEyeAfterCaptureGrace(void) {
     RSRestoreTransientRedLeaves();
     if (container) RSHideContainer(container);
     RSSuppressTransientRecordingRedContainers();
-    // V7.11.9.4.3.2.6.28：恢复时不要“先亮再纠偏”。
-    // 用户实测：暂停→点空白，素材会先在最旧位置闪一下再跳到正确位置。
-    // 现在改成“几何稳定后才显示”：最多等 0.20s，一旦连续两次同步位置一致就点亮；
-    // 到点即使没稳定也显示（不会永久不出现）。
-    RSIslandShowGate = YES;
-    RSIslandShowDeadline = now + 0.20;
-    RSIslandGateHits = 0;
-    RSIslandGateCenter = CGPointZero;
+    // V7.11.9.4.3.2.6.29：恢复时直接保持可见。
+    // 6.28 的“显示门”在 capture 状态每秒抖动的情况下反而造成闪烁，
+    // 现在既然 capture-off 不再隐藏素材，这里也就不需要门。
+    RSIslandShowGate = NO;
     eye.alpha = 1.0;
-    eye.hidden = YES;
-    RSLog(@"[V7.11.9.4.3.2.6.28] eye show gated until geometry stable sameIdentity=%d", sameIdentity);
+    eye.hidden = NO;
+    RSLog(@"[V7.11.9.4.3.2.6.29] eye kept visible on resume sameIdentity=%d", sameIdentity);
 
     // 若宿主随后被系统替换，既有 refresh/remount 链负责重挂载；这里额外保留一次
     // 非阻塞式几何校正，不再把 eye 隐藏等待。
@@ -1237,21 +1215,37 @@ static UIView *RSV74GlobalNativeIndicator(void) {
     return best;
 }
 
-// V7.11.9.4.3.2.6.27：判断红点是否真的属于这块录屏元素。
-// 日志实证：打开地图后出现 `V7.3 native indicator locked ... frame={{415, 26.33}, ...}`
-// 和 `SIDEFIX visual side changed=right host=SBRecordingIndicatorView screenX=417.83`
-// —— 全局扫描抓到了**屏幕最右边**另一个活动的红点，素材就飞出去了。
-// 现在要求红点与录屏元素的矩形间隙在合理范围内（X ≤ 40pt，Y ≤ 24pt）。
+// V7.11.9.4.3.2.6.29：判断红点是否属于“录屏岛”。
+// 6.27 用录屏元素矩形算间隙 —— 但录屏元素实测是整宽视图，这个判据把**正确**红点也拒了
+// （6.28 日志里上千次 `native dot pending`，零次 `native indicator locked`）。
+// 现在改用药丸容器：红点中心与药丸中心的距离 ≤ 60pt 才算同一块岛。
+// 地图那个跑偏的红点在 x≈415，而录屏药丸在左侧，距离 >150pt，会被正确排除。
+
+static UIView *RSIslandRecordingContainerForElement(UIView *element);
+
+// V7.11.9.4.3.2.6.29：红点归属判定 —— 用“药丸容器”而不是录屏元素矩形。
 static BOOL RSV73IndicatorBelongsToElement(UIView *indicator, UIView *element) {
-    if (!indicator || !element || !element.window || !indicator.window) return NO;
+    if (!indicator || !indicator.window) return NO;
+    if (!element) return NO;
+    UIView *pill = RSIslandRecordingContainerForElement(element);
+    if (!pill || !pill.window) return YES;   // 药丸还找不到时不做否定
     @try {
-        CGRect ir = [indicator convertRect:indicator.bounds toView:element.window];
-        CGRect er = [element convertRect:element.bounds toView:element.window];
-        if (CGRectIsEmpty(ir) || CGRectIsEmpty(er)) return NO;
-        CGFloat gapX = MAX(0.0, MAX(er.origin.x - CGRectGetMaxX(ir), ir.origin.x - CGRectGetMaxX(er)));
-        CGFloat gapY = MAX(0.0, MAX(er.origin.y - CGRectGetMaxY(ir), ir.origin.y - CGRectGetMaxY(er)));
-        return (gapX <= 40.0 && gapY <= 24.0);
-    } @catch (...) { return NO; }
+        CGPoint ic = [indicator convertPoint:CGPointMake(CGRectGetMidX(indicator.bounds),
+                                                         CGRectGetMidY(indicator.bounds))
+                                      toView:pill.window];
+        CGRect pr = [pill convertRect:pill.bounds toView:pill.window];
+        if (CGRectIsEmpty(pr)) return YES;
+        CGFloat d = hypot(ic.x - CGRectGetMidX(pr), ic.y - CGRectGetMidY(pr));
+        if (d <= 60.0) return YES;
+        static NSTimeInterval lastLog = 0;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastLog > 1.0) {
+            lastLog = now;
+            RSLog(@"[V7.11.9.4.3.2.6.29] ignore foreign indicator frame=%@ d=%.1f",
+                  NSStringFromCGRect(indicator.frame), d);
+        }
+        return NO;
+    } @catch (...) { return YES; }
 }
 
 static UIView *RSV73NativeRecordingIndicatorInElement(UIView *element) {
@@ -1762,14 +1756,65 @@ static void RSIslandRoundAccessoryHost(UIView *host) {
 //   如果上一次用的药丸仍然可用，直接沿用（迟滞，避免切程序时来回跳）。
 static __weak UIView *RSIslandStickyPill = nil;
 
+// V7.11.9.4.3.2.6.29：核心修复 —— 药丸容器改为“从 portal 反查”，不再依赖元素矩形。
+// 日志证据：整个 6.28 会话里 `native dot pending, temporary fallback` 刷了上千次，
+// 一条 `native indicator locked` 都没有 —— 6.27 加的归属过滤把**正确**红点也拒了
+// （录屏元素是整宽视图，用它的矩形去算间隙本来就不可靠）。
+// 现在：遍历 SBSystemAperture 窗口里的药丸容器，看它子树里的 `_UIPortalView.sourceView`
+// 是否指向 SBRecordingIndicatorView（尺寸 3~12pt）—— 只有录屏那块药丸才满足。
+// 这样切换 App、元素被重建、红点窗口抖动都不影响定位。
+static BOOL RSIslandViewHoldsRecordingIndicator(UIView *root, NSInteger depth) {
+    if (!root || depth > 12) return NO;
+    NSString *n = NSStringFromClass(root.class);
+    if ([n rangeOfString:@"_UIPortalView"].location != NSNotFound) {
+        UIView *source = nil;
+        @try {
+            id c = [root valueForKey:@"sourceView"];
+            if ([c isKindOfClass:[UIView class]]) source = c;
+        } @catch (...) {}
+        if (!source) {
+            @try {
+                id c = RSInstanceVariable(root, "_sourceView");
+                if ([c isKindOfClass:[UIView class]]) source = c;
+            } @catch (...) {}
+        }
+        if (source) {
+            NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:source];
+            NSInteger g = 0;
+            while (q.count && g++ < 200) {
+                UIView *v = q.lastObject;
+                [q removeLastObject];
+                if (RSV74LooksLikeNativeIndicator(v) || RSV73ClassLooksLikeIndicator(v)) return YES;
+                for (UIView *sub in v.subviews) [q addObject:sub];
+            }
+        }
+    }
+    for (UIView *sub in root.subviews) {
+        if (RSIslandViewHoldsRecordingIndicator(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+// 只按“类名 + 尺寸”判断，不要求特定 window（portal 的 source 可能在别的窗口里）。
+static BOOL RSV73ClassLooksLikeIndicator(UIView *v) {
+    if (!v) return NO;
+    Class cls = NSClassFromString(@"SBRecordingIndicatorView");
+    BOOL nameOK = cls ? [v isKindOfClass:cls]
+                      : [NSStringFromClass(v.class) isEqualToString:@"SBRecordingIndicatorView"];
+    if (!nameOK) return NO;
+    CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
+    return (w >= 3.0 && h >= 3.0 && w <= 12.0 && h <= 12.0);
+}
+
 static BOOL RSIslandPillUsable(UIView *v, UIView *element) {
     if (!v || !v.window || v.hidden || v.alpha <= 0.01) return NO;
+    CGFloat cw = CGRectGetWidth(v.bounds), ch = CGRectGetHeight(v.bounds);
+    if (cw < 40.0 || cw > 260.0 || ch < 24.0 || ch > 50.0) return NO;
+    if (RSIslandViewHoldsRecordingIndicator(v, 0)) return YES;
     if (!element || !element.window) return NO;
     CGRect cr = [v convertRect:v.bounds toView:element.window];
     CGRect er = [element convertRect:element.bounds toView:element.window];
     if (CGRectIsEmpty(cr) || CGRectIsEmpty(er)) return NO;
-    CGFloat cw = CGRectGetWidth(cr), ch = CGRectGetHeight(cr);
-    if (cw < 40.0 || cw > 260.0 || ch < 24.0 || ch > 50.0) return NO;
     CGRect pad = CGRectInset(er, -46.0, -12.0);
     CGRect inter = CGRectIntersection(pad, cr);
     if (CGRectIsNull(inter)) return NO;
@@ -1777,16 +1822,23 @@ static BOOL RSIslandPillUsable(UIView *v, UIView *element) {
 }
 
 static UIView *RSIslandRecordingContainerForElement(UIView *element) {
-    if (!element || !element.window) return nil;
-    UIWindow *win = element.window;
-    CGRect er = [element convertRect:element.bounds toView:win];
-    if (CGRectIsEmpty(er)) return nil;
+    // 元素不在窗口也继续找（切 App 时元素会短暂离窗，但药丸还在）。
+    UIView *winRef = (element && element.window) ? element.window
+                                                  : [RSAllApplicationWindows() firstObject];
+    if (!winRef) return nil;
+    UIWindow *win = winRef;
+    CGRect er = CGRectZero;
+    if (element && element.window) {
+        er = [element convertRect:element.bounds toView:win];
+    }
+    if (element && !element.window) element = nil;
 
     // 迟滞：上一次的药丸还可用就继续用，避免切换程序时在两个候选间跳。
     UIView *sticky = RSIslandStickyPill;
     if (sticky && RSIslandPillUsable(sticky, element)) return sticky;
 
     CGRect pad = CGRectInset(er, -46.0, -12.0);
+    BOOL havePad = !CGRectIsNull(pad) && CGRectGetWidth(pad) > 1.0 && CGRectGetHeight(pad) > 1.0;
     UIView *best = nil;
     CGFloat bestRatio = 0.0, bestArea = CGFLOAT_MAX;
     for (UIWindow *w in RSAllApplicationWindows()) {
@@ -1797,18 +1849,29 @@ static UIView *RSIslandRecordingContainerForElement(UIView *element) {
             [stack removeLastObject];
             if ([NSStringFromClass(v.class) isEqualToString:@"SBSystemApertureContainerView"] &&
                 v.window && !v.hidden && v.alpha > 0.01) {
-                CGRect cr = [v convertRect:v.bounds toView:win];
-                CGFloat cw = CGRectGetWidth(cr), ch = CGRectGetHeight(cr);
-                if (!CGRectIsEmpty(cr) && cw >= 40.0 && cw <= 260.0 && ch >= 24.0 && ch <= 50.0) {
-                    CGRect inter = CGRectIntersection(pad, cr);
-                    if (!CGRectIsNull(inter)) {
-                        CGFloat iw = CGRectGetWidth(inter), ih = CGRectGetHeight(inter);
-                        CGFloat ratio = (iw * ih) / MAX(cw * ch, 1.0);
-                        CGFloat area = iw * ih;
-                        if (ratio >= 0.5 && (ratio > bestRatio + 0.02 ||
-                                             (fabs(ratio - bestRatio) <= 0.02 && area < bestArea))) {
-                            bestRatio = ratio; bestArea = area; best = v;
+                CGFloat cw = CGRectGetWidth(v.bounds), ch = CGRectGetHeight(v.bounds);
+                if (cw >= 40.0 && cw <= 260.0 && ch >= 24.0 && ch <= 50.0) {
+                    // V7.11.9.4.3.2.6.29：主判据改成“这块容器里有没有录屏的 portal”。
+                    // 这样切 App / 元素短暂离窗 / 红点窗口抖动时都能继续找到正确的药丸。
+                    BOOL holds = RSIslandViewHoldsRecordingIndicator(v, 0);
+                    CGFloat ratio = 0.0;
+                    CGRect cr = CGRectZero;
+                    if (havePad) {
+                        cr = [v convertRect:v.bounds toView:win];
+                        if (!CGRectIsEmpty(cr)) {
+                            CGRect inter = CGRectIntersection(pad, cr);
+                            if (!CGRectIsNull(inter)) {
+                                ratio = (CGRectGetWidth(inter) * CGRectGetHeight(inter)) / MAX(cw * ch, 1.0);
+                            }
                         }
+                    }
+                    // 只认：含录屏 portal，或（元素矩形可用时）与元素基本重合
+                    if (!holds && !(havePad && ratio >= 0.5)) continue;
+                    CGFloat area = cw * ch;
+                    CGFloat scoreRatio = holds ? 1.0 : ratio;
+                    if (scoreRatio > bestRatio + 0.02 ||
+                        (fabs(scoreRatio - bestRatio) <= 0.02 && area < bestArea)) {
+                        bestRatio = scoreRatio; bestArea = area; best = v;
                     }
                 }
             }
@@ -1824,7 +1887,9 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     if (!RSRecordingActive || RSCaptureStopPending || ![UIScreen mainScreen].isCaptured) return;
     if (!RSEyeMountedInElement || !RSEyeMountedElement || RSEyeMountedElement != element) return;
     UIImageView *eye = RSSharinganView;
-    if (!eye || !element.window) return;
+    // V7.11.9.4.3.2.6.29：不再要求 element.window。切 App 时元素会短暂离窗，
+    // 但药丸容器还在 —— 此时继续按药丸同步，素材就不会掉回 fallback。
+    if (!eye) return;
 
     // V7.11.9.4.3.2.6.27：优先把素材挂进药丸容器，贴在端点圆弧上。
     // 这就是用户要的“素材贴边”：圆心 = 胶囊左/右端圆弧圆心，直径取 min(设置尺寸, 药丸高度)，
@@ -1876,28 +1941,8 @@ static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
             // 右侧独立小岛的圆角处理被跳过了 —— 用户看到“右边又不圆了”。这里补上。
             RSIslandRoundAccessoryHost(pill);
 
-            // V7.11.9.4.3.2.6.28：显示门判定 —— 连续两次落在同一位置才点亮，或到点强制点亮。
-            // 这是“点空白后素材闪一下”的修法：宁晚 0.1 秒，也不在旧位置闪。
-            BOOL gateDone = YES;
-            if (RSIslandShowGate) {
-                NSTimeInterval gateNow = CACurrentMediaTime();
-                CGFloat gd = hypot(c.x - RSIslandGateCenter.x, c.y - RSIslandGateCenter.y);
-                if (gd <= 1.0) {
-                    RSIslandGateHits++;
-                } else {
-                    RSIslandGateHits = 1;
-                    RSIslandGateCenter = c;
-                }
-                gateDone = (RSIslandGateHits >= 2) || (gateNow > RSIslandShowDeadline);
-                if (gateDone) {
-                    RSIslandShowGate = NO;
-                    RSLog(@"[V7.11.9.4.3.2.6.28] eye shown after geometry gate hits=%lu center={%.2f,%.2f}",
-                          (unsigned long)RSIslandGateHits, c.x, c.y);
-                }
-            }
-
-            if (allowShow && gateDone && !RSEyeGracePaused && !RSEyeResumeVisibilityPending &&
-                !RSRightTransitionSuppressed) {
+            // V7.11.9.4.3.2.6.29：不再做显示门。素材挂着药丸容器，正常情况下应当一直可见。
+            if (allowShow) {
                 if (eye.hidden) eye.hidden = NO;
                 if (eye.alpha < 0.01) eye.alpha = 1.0;
             }
@@ -3210,27 +3255,20 @@ static void RSUpdateRecordingState(void) {
         RSCaptureStopStartedAt = [NSDate timeIntervalSinceReferenceDate];
         RSCancelCaptureResumeConfirmation();
         NSUInteger generation = ++RSCaptureStopGeneration;
-        // V7.11.9.4.3.2.6.26：不要立刻隐藏。点一下灵动岛会短暂 capture-off，
-        // 紧接着点空白就恢复；立刻隐藏再显示，肉眼就是“素材要 1~2 秒才回来”。
-        // 这里先挂 0.18s，期间如果恢复就被取消，完全不会闪。
-        NSUInteger pauseGen = ++RSPauseEyeGeneration;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (pauseGen != RSPauseEyeGeneration) return;
-            if (!RSCaptureStopPending || !RSRecordingActive) return;
-            RSLog(@"capture-off still pending after 0.18s -> hide eye now");
-            RSPauseEyeForCaptureGrace();
-            if (RSInstalledContainer) RSHideContainer(RSInstalledContainer);
-            RSStopPollTimer();
-            RSStopGeometryDisplayLink();
-        });
-        // 恢复检测提速：0.5s 的状态复核太慢，这里在宽限期内每 0.1s 复核一次。
+        // V7.11.9.4.3.2.6.29：**不再隐藏素材**。
+        // 实机日志证明 UIScreen.isCaptured 在录屏过程中会每秒抖一次 NO
+        // （12:59:39 / 40 / 41 / 42 … 连续 `capture-off grace started`），
+        // 每次隐藏 0.18s 就造成用户看到的“闪一下”和“长时间只剩红点”。
+        // 素材现在是系统药丸容器的子视图：录屏真停时药丸消失，素材自然一起消失，
+        // 根本不需要我们手动隐藏。所以这里只做“会话保持 + 延迟确认真正停止”。
+        RSLog(@"capture-off grace started %.2fs (session preserved, eye kept visible)", RSCaptureStopGrace);
+        // 复核提速：宽限期内每 0.1s 看一次真实状态，恢复就立刻取消 pending。
         for (int i = 1; i <= 12; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (!RSCaptureStopPending || !RSRecordingActive) return;
                 @try { RSUpdateRecordingState(); } @catch (...) {}
             });
         }
-        RSLog(@"capture-off grace started %.2fs (session preserved, eye hidden/paused, drivers suspended)", RSCaptureStopGrace);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RSCaptureStopGrace * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             RSFinalizeRecordingStop(generation);
         });
