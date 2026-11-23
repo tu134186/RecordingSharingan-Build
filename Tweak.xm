@@ -100,9 +100,6 @@ static BOOL RSEyeGracePaused = NO;
 static NSUInteger RSPauseEyeGeneration = 0;
 // V7.11.9.4.3.2.6.28：恢复显示门 —— 几何稳定后才点亮，避免“先亮再跳”
 static BOOL RSIslandShowGate = NO;
-static NSTimeInterval RSIslandShowDeadline = 0;
-static NSUInteger RSIslandGateHits = 0;
-static CGPoint RSIslandGateCenter = {0, 0};
 // v5.7.19：APP/Live Activity 场景从右侧独立圆结束录屏时，系统会在真正停止后的尾声
 // 短暂把 isCaptured 再抖回 YES。旧版会立刻把 eye 重新显示，形成“右圆结束 -> 长条红点/写轮眼
 // 又转一下 -> 再暂停”的视觉回弹。恢复录屏改为“持续 YES 确认”后才显示。
