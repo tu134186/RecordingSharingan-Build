@@ -3324,16 +3324,6 @@ static void RSV791InstallAccessoryRuntimeHooks(void) {
 static NSMapTable<UIView *, NSValue *> *RSIslandBaselines = nil;
 static NSTimeInterval RSIslandLastExtendLog = 0;
 
-static CGRect RSIslandRecordedFrame(UIView *v) {
-    if (!v || !RSIslandBaselines) return CGRectNull;
-    NSValue *value = [RSIslandBaselines objectForKey:v];
-    return value ? value.CGRectValue : CGRectNull;
-}
-static void RSIslandRememberFrame(UIView *v, CGRect frame) {
-    if (!v || CGRectIsNull(frame)) return;
-    if (!RSIslandBaselines) RSIslandBaselines = [NSMapTable weakToStrongObjectsMapTable];
-    [RSIslandBaselines setObject:[NSValue valueWithCGSize:frame.size] forKey:v];
-}
 static void RSIslandForgetFrames(void) {
     @try { [RSIslandBaselines removeAllObjects]; } @catch (...) {}
     RSIslandBaselines = nil;
