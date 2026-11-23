@@ -1763,6 +1763,17 @@ static __weak UIView *RSIslandStickyPill = nil;
 // 现在：遍历 SBSystemAperture 窗口里的药丸容器，看它子树里的 `_UIPortalView.sourceView`
 // 是否指向 SBRecordingIndicatorView（尺寸 3~12pt）—— 只有录屏那块药丸才满足。
 // 这样切换 App、元素被重建、红点窗口抖动都不影响定位。
+// 只按“类名 + 尺寸”判断，不要求特定 window（portal 的 source 可能在别的窗口里）。
+static BOOL RSV73ClassLooksLikeIndicator(UIView *v) {
+    if (!v) return NO;
+    Class cls = NSClassFromString(@"SBRecordingIndicatorView");
+    BOOL nameOK = cls ? [v isKindOfClass:cls]
+                      : [NSStringFromClass(v.class) isEqualToString:@"SBRecordingIndicatorView"];
+    if (!nameOK) return NO;
+    CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
+    return (w >= 3.0 && h >= 3.0 && w <= 12.0 && h <= 12.0);
+}
+
 static BOOL RSIslandViewHoldsRecordingIndicator(UIView *root, NSInteger depth) {
     if (!root || depth > 12) return NO;
     NSString *n = NSStringFromClass(root.class);
@@ -1795,17 +1806,6 @@ static BOOL RSIslandViewHoldsRecordingIndicator(UIView *root, NSInteger depth) {
     return NO;
 }
 
-// 只按“类名 + 尺寸”判断，不要求特定 window（portal 的 source 可能在别的窗口里）。
-static BOOL RSV73ClassLooksLikeIndicator(UIView *v) {
-    if (!v) return NO;
-    Class cls = NSClassFromString(@"SBRecordingIndicatorView");
-    BOOL nameOK = cls ? [v isKindOfClass:cls]
-                      : [NSStringFromClass(v.class) isEqualToString:@"SBRecordingIndicatorView"];
-    if (!nameOK) return NO;
-    CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
-    return (w >= 3.0 && h >= 3.0 && w <= 12.0 && h <= 12.0);
-}
-
 static BOOL RSIslandPillUsable(UIView *v, UIView *element) {
     if (!v || !v.window || v.hidden || v.alpha <= 0.01) return NO;
     CGFloat cw = CGRectGetWidth(v.bounds), ch = CGRectGetHeight(v.bounds);
@@ -1823,10 +1823,9 @@ static BOOL RSIslandPillUsable(UIView *v, UIView *element) {
 
 static UIView *RSIslandRecordingContainerForElement(UIView *element) {
     // 元素不在窗口也继续找（切 App 时元素会短暂离窗，但药丸还在）。
-    UIView *winRef = (element && element.window) ? element.window
-                                                  : [RSAllApplicationWindows() firstObject];
-    if (!winRef) return nil;
-    UIWindow *win = winRef;
+    UIWindow *win = element ? element.window : nil;
+    if (!win) win = [RSAllApplicationWindows() firstObject];
+    if (!win) return nil;
     CGRect er = CGRectZero;
     if (element && element.window) {
         er = [element convertRect:element.bounds toView:win];
