@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.26";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.27";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -1209,15 +1209,42 @@ static UIView *RSV74GlobalNativeIndicator(void) {
     return best;
 }
 
+// V7.11.9.4.3.2.6.27：判断红点是否真的属于这块录屏元素。
+// 日志实证：打开地图后出现 `V7.3 native indicator locked ... frame={{415, 26.33}, ...}`
+// 和 `SIDEFIX visual side changed=right host=SBRecordingIndicatorView screenX=417.83`
+// —— 全局扫描抓到了**屏幕最右边**另一个活动的红点，素材就飞出去了。
+// 现在要求红点与录屏元素的矩形间隙在合理范围内（X ≤ 40pt，Y ≤ 24pt）。
+static BOOL RSV73IndicatorBelongsToElement(UIView *indicator, UIView *element) {
+    if (!indicator || !element || !element.window || !indicator.window) return NO;
+    @try {
+        CGRect ir = [indicator convertRect:indicator.bounds toView:element.window];
+        CGRect er = [element convertRect:element.bounds toView:element.window];
+        if (CGRectIsEmpty(ir) || CGRectIsEmpty(er)) return NO;
+        CGFloat gapX = MAX(0.0, MAX(er.origin.x - CGRectGetMaxX(ir), ir.origin.x - CGRectGetMaxX(er)));
+        CGFloat gapY = MAX(0.0, MAX(er.origin.y - CGRectGetMaxY(ir), ir.origin.y - CGRectGetMaxY(er)));
+        return (gapX <= 40.0 && gapY <= 24.0);
+    } @catch (...) { return NO; }
+}
+
 static UIView *RSV73NativeRecordingIndicatorInElement(UIView *element) {
     if (!element) return nil;
 
-    // V7.4 首选直接 Hook 捕获到的真实 9x9 SBRecordingIndicatorView。
-    UIView *captured = RSV74GlobalNativeIndicator();
-    if (captured) return captured;
-
+    // V7.11.9.4.3.2.6.27：先在本元素子树里找（最可靠），
+    // 再从全局找但必须校验归属，避免拿到别的活动（地图/音乐）的红点。
     UIView *direct = RSV73FindViewByClassName(element, @"SBRecordingIndicatorView", 0);
-    if (RSV74LooksLikeNativeIndicator(direct)) return direct;
+    if (RSV74LooksLikeNativeIndicator(direct) && RSV73IndicatorBelongsToElement(direct, element)) return direct;
+
+    UIView *captured = RSV74GlobalNativeIndicator();
+    if (captured && RSV73IndicatorBelongsToElement(captured, element)) return captured;
+    if (captured) {
+        static NSTimeInterval lastForeignLog = 0;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastForeignLog > 1.0) {
+            lastForeignLog = now;
+            RSLog(@"[V7.11.9.4.3.2.6.27] ignore foreign indicator frame=%@ (not near recording element)",
+                  NSStringFromCGRect(captured.frame));
+        }
+    }
 
     // Portal 的 sourceView 不一定以普通 subview 形式暴露，因此单独探测。
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:element];
@@ -1694,12 +1721,105 @@ static void RSIslandRoundAccessoryHost(UIView *host) {
     } @catch (...) {}
 }
 
+// V7.11.9.4.3.2.6.27：录屏岛的“黑色药丸”容器。
+// 之前素材挂在 22x22 的 accessory portal 里，portal 太小，会把 37pt 的圆形素材
+// 上下切成平边（用户看到的“缺角/被挖掉一块”就是这么来的 —— 实测红色区域 y 只有 68px=30.2pt，
+// 而设置尺寸是 36.99pt）。药丸容器高度 36.67pt，素材挂进去就能完整显示、还能严格贴边。
+static UIView *RSIslandRecordingContainerForElement(UIView *element) {
+    if (!element || !element.window) return nil;
+    UIWindow *win = element.window;
+    CGRect er = [element convertRect:element.bounds toView:win];
+    if (CGRectIsEmpty(er)) return nil;
+    CGRect pad = CGRectInset(er, -46.0, -12.0);
+    UIView *best = nil;
+    CGFloat bestArea = 0.0;
+    for (UIWindow *w in RSAllApplicationWindows()) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        NSInteger guard = 0;
+        while (stack.count && guard++ < 1200) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if ([NSStringFromClass(v.class) isEqualToString:@"SBSystemApertureContainerView"] &&
+                v.window && !v.hidden && v.alpha > 0.01) {
+                CGRect cr = [v convertRect:v.bounds toView:win];
+                CGFloat cw = CGRectGetWidth(cr), ch = CGRectGetHeight(cr);
+                if (!CGRectIsEmpty(cr) && cw >= 40.0 && cw <= 420.0 && ch >= 18.0 && ch <= 160.0) {
+                    CGRect inter = CGRectIntersection(pad, cr);
+                    if (!CGRectIsNull(inter)) {
+                        CGFloat ratio = (CGRectGetWidth(inter) * CGRectGetHeight(inter)) /
+                                        MAX(cw * ch, 1.0);
+                        CGFloat area = CGRectGetWidth(inter) * CGRectGetHeight(inter);
+                        if (ratio >= 0.5 && area > bestArea) { bestArea = area; best = v; }
+                    }
+                }
+            }
+            for (UIView *sub in v.subviews) [stack addObject:sub];
+        }
+    }
+    return best;
+}
+
 // 位置同步：监听 SAUIElementView frame/center/layout，写轮眼跟随宿主
 static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     if (!RSRecordingActive || RSCaptureStopPending || ![UIScreen mainScreen].isCaptured) return;
     if (!RSEyeMountedInElement || !RSEyeMountedElement || RSEyeMountedElement != element) return;
     UIImageView *eye = RSSharinganView;
     if (!eye || !element.window) return;
+
+    // V7.11.9.4.3.2.6.27：优先把素材挂进药丸容器，贴在端点圆弧上。
+    // 这就是用户要的“素材贴边”：圆心 = 胶囊左/右端圆弧圆心，直径取 min(设置尺寸, 药丸高度)，
+    // 素材与药丸圆弧同心同半径 → 既完整显示也绝不会被切出缺角，
+    // 而且位置仍然是系统自己决定的（药丸在哪边、素材就在哪边）。
+    UIView *pill = RSIslandRecordingContainerForElement(element);
+    if (pill && pill.window) {
+        CGFloat pw = CGRectGetWidth(pill.bounds), ph = CGRectGetHeight(pill.bounds);
+        if (pw >= 24.0 && ph >= 18.0) {
+            BOOL right = RSPreferenceSideForHost(pill);
+            BOOL wasRight = RSEyeGeometryHasSide ? RSEyeGeometryRight : right;
+            CGFloat configured = right ? RSRightSize() : RSLeftSize();
+            // 不超过药丸高度，避免上下被药丸圆角切掉
+            CGFloat side = MIN(configured, ph);
+            if (eye.superview != pill) {
+                [eye removeFromSuperview];
+                [pill addSubview:eye];
+            }
+            [pill bringSubviewToFront:eye];
+            RSEyeHostElement = pill;
+            RSApplyMaterialForSide(eye, right);
+
+            CGFloat radius = ph / 2.0;
+            CGPoint c = right ? CGPointMake(pw - radius, ph / 2.0)
+                              : CGPointMake(radius, ph / 2.0);
+            c.x += right ? RSRightXOffset() : RSLeftXOffset();
+            c.y += RSYOffset();
+
+            [UIView performWithoutAnimation:^{
+                eye.bounds = CGRectMake(0, 0, side, side);
+                eye.center = c;
+            }];
+            eye.layer.cornerRadius = 0.0;
+            eye.clipsToBounds = NO;
+            eye.layer.masksToBounds = NO;
+            if (![eye.layer animationForKey:@"rs.rotation"]) RSStartRotation(eye);
+
+            RSEyeGeometryRight = right;
+            RSEyeGeometryHasSide = YES;
+            if (wasRight != right) {
+                NSTimeInterval now = CACurrentMediaTime();
+                if (now - RSVisualSideLastLog > 0.5) {
+                    RSVisualSideLastLog = now;
+                    RSLog(@"[V7.11.9.4.3.2.6.27] pill host side=%@ hostBounds=%@ size=%.2f",
+                          right ? @"right" : @"left", NSStringFromCGRect(pill.bounds), side);
+                }
+            }
+            if (allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending &&
+                !RSRightTransitionSuppressed) {
+                if (eye.hidden) eye.hidden = NO;
+                if (eye.alpha < 0.01) eye.alpha = 1.0;
+            }
+            return;
+        }
+    }
 
     UIView *indicator = RSV73NativeRecordingIndicatorInElement(element);
     if (indicator && indicator.window && indicator.superview) {

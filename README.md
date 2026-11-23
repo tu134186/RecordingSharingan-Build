@@ -1,6 +1,6 @@
-# RecordingSharingan 6.26
+# RecordingSharingan 6.27
 
-Widen only the recording island container (log-driven), gap-based host rejection,
-no hide flicker on pause/resume.
+Material moved into the pill container (flush edge, no clipped corner);
+native dot ownership check so it cannot jump to another Live Activity.
 
-See FIX-6.26.md.
+See FIX-6.27.md.
