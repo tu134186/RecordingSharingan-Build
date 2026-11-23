@@ -1891,6 +1891,8 @@ static UIView *RSIslandRecordingContainerForElement(UIView *element) {
 // 结论：位置可以照抄 portal/红点，但**父视图必须是药丸容器**，并且每次布局都 bringToFront。
 // ===================================================================
 
+static void RS20ScheduleRefresh(void);   // defined later; used by RSReloadEyeImage (6.31)
+
 static UIView *RSV631EnclosingPill(UIView *v) {
     UIView *cur = v;
     for (NSInteger i = 0; i < 12 && cur; i++, cur = cur.superview) {
