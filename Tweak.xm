@@ -45,7 +45,7 @@ static NSArray<UIWindow *> *RSAllApplicationWindows(void) {
  * - 保留设置总开关、两套素材、旋转速度、左右 X / Y 坐标和左右尺寸实时微调。
  */
 
-static NSString * const RSVersion = @"7.11.9.4.3.2.6.29";
+static NSString * const RSVersion = @"7.11.9.4.3.2.6.30";
 static NSString * const RSLogPath = @"/var/mobile/RecordingSharingan-V7.log";
 static CFStringRef const RSPrefsDomain = CFSTR("com.tu.recordingsharingan.settings");
 static CFStringRef const RSLegacyPrefsDomain = CFSTR("com.recordingsharigan.settings");
@@ -1774,7 +1774,9 @@ static BOOL RSV73ClassLooksLikeIndicator(UIView *v) {
 static BOOL RSIslandViewHoldsRecordingIndicator(UIView *root, NSInteger depth) {
     if (!root || depth > 12) return NO;
     NSString *n = NSStringFromClass(root.class);
-    if ([n rangeOfString:@"_UIPortalView"].location != NSNotFound) {
+    // V7.11.9.4.3.2.6.30：系统用的是 SBSystemApertureSceneElementAccessoryPortalView，
+    // 名字里没有 _UIPortalView —— 6.29 的 portal 反查因此一次都没命中。
+    if ([n rangeOfString:@"Portal" options:NSCaseInsensitiveSearch].location != NSNotFound) {
         UIView *source = nil;
         @try {
             id c = [root valueForKey:@"sourceView"];
@@ -1876,6 +1878,280 @@ static UIView *RSIslandRecordingContainerForElement(UIView *element) {
     }
     if (best) RSIslandStickyPill = best;
     return best;
+}
+
+// ===================================================================
+// V7.11.9.4.3.2.6.30 —— 完全照抄系统红点（用户给的比喻：素材只是脸谱）
+// 6.29 实机日志 + 录屏（55s）证明：
+//   1) 屏幕右侧 x≈415 还有一个“离屏副本”SBRecordingIndicatorView，6.29 一直把
+//      那个副本当成本体隐藏（日志 `indicator alpha 1.00 -> 0.00 frame={{415,...}}`），
+//      真正的红点从未被压住 → 视频里“写轮眼没了、红点还在”。
+//   2) 药丸容器靠“元素矩形 / portal 类名含 _UIPortalView”反查，可系统用的是
+//      `SBSystemApertureSceneElementAccessoryPortalView`（名字里没有 _UIPortalView），
+//      于是永远查不到 → 掉回 17x22 的 accessory portal，素材被黑背板盖住 → 看起来消失。
+// 现在只认一件事：**红点画在哪，素材就摆在哪**。
+//   - 先找容器子树里镜像红点的 portal（它的 frame 就是红点呈现位置）；
+//   - 没有 portal 就直接找屏幕矩形落在容器内的真红点；
+//   - 素材以该视图中心为圆心，直径 min(设置, 容器高)，再夹在容器内；
+//   - 只压住“这个容器里”的红点，别处的副本一律还原 alpha。
+// 另外在 SBSystemApertureContainerView -layoutSubviews 里重新摆一次（跳舞的做法），
+// 不再依赖 CADisplayLink 时序，系统重建背板后也不会被盖到下面。
+// ===================================================================
+
+static NSArray<UIView *> *RSV630IndicatorCache = nil;
+static NSTimeInterval RSV630IndicatorCacheAt = 0;
+
+static void RSV630CollectIndicators(UIView *root, NSMutableArray<UIView *> *out, NSInteger depth) {
+    if (!root || depth > 14 || out.count > 24) return;
+    NSString *n = NSStringFromClass(root.class);
+    if (([n isEqualToString:@"SBRecordingIndicatorView"] || RSV74LooksLikeNativeIndicator(root)) &&
+        !root.hidden && root.alpha > 0.01 && root.window) {
+        [out addObject:root];
+    }
+    for (UIView *sub in root.subviews) RSV630CollectIndicators(sub, out, depth + 1);
+}
+
+static NSArray<UIView *> *RSV630AllIndicators(void) {
+    NSTimeInterval now = CACurrentMediaTime();
+    if (RSV630IndicatorCache && now - RSV630IndicatorCacheAt < 0.10) return RSV630IndicatorCache;
+    NSMutableArray<UIView *> *out = [NSMutableArray array];
+    @try {
+        for (UIWindow *w in RSAllApplicationWindows()) RSV630CollectIndicators(w, out, 0);
+    } @catch (...) {}
+    RSV630IndicatorCache = out;
+    RSV630IndicatorCacheAt = now;
+    return out;
+}
+
+static CGRect RSV630ScreenRectOfView(UIView *v) {
+    CGRect r = CGRectZero;
+    if (!v || !v.window) return r;
+    @try {
+        r = [v convertRect:v.bounds toView:v.window];
+        r.origin.x += v.window.frame.origin.x;
+        r.origin.y += v.window.frame.origin.y;
+    } @catch (...) { r = CGRectZero; }
+    return r;
+}
+
+static BOOL RSV630ClassLooksLikePortal(UIView *v) {
+    if (!v) return NO;
+    NSString *n = NSStringFromClass(v.class);
+    return [n rangeOfString:@"Portal" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static UIView *RSV630PortalSourceView(UIView *portal) {
+    id src = nil;
+    @try { src = [portal valueForKey:@"sourceView"]; } @catch (...) {}
+    if (![src isKindOfClass:[UIView class]]) {
+        @try { src = [portal valueForKey:@"_sourceView"]; } @catch (...) {}
+    }
+    return [src isKindOfClass:[UIView class]] ? (UIView *)src : nil;
+}
+
+// portal 里镜像的是不是录屏红点？是则返回那个红点视图（供压制 alpha 用）
+static UIView *RSV630PortalDotView(UIView *portal) {
+    UIView *source = RSV630PortalSourceView(portal);
+    if (!source) return nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:source];
+    NSInteger guard = 0;
+    while (stack.count && guard++ < 300) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
+        NSString *n = NSStringFromClass(v.class);
+        if ([n isEqualToString:@"SBRecordingIndicatorView"]) return v;
+        if (RSV74LooksLikeNativeIndicator(v)) return v;
+        if (w >= 3.0 && h >= 3.0 && w <= 12.0 && h <= 12.0 && [n rangeOfString:@"Indicator"].location != NSNotFound)
+            return v;
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    return nil;
+}
+
+static UIView *RSV630FindDotPortal(UIView *root, NSInteger depth) {
+    if (!root || depth > 12) return nil;
+    if (RSV630ClassLooksLikePortal(root) && RSV630PortalDotView(root)) return root;
+    for (UIView *sub in root.subviews) {
+        UIView *r = RSV630FindDotPortal(sub, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+// 真红点是否“画在”这块容器里（屏幕矩形命中）
+static UIView *RSV630RealIndicatorInside(UIView *pill) {
+    CGRect pr = RSV630ScreenRectOfView(pill);
+    if (CGRectIsEmpty(pr)) return nil;
+    CGRect hit = CGRectInset(pr, -4.0, -4.0);
+    UIView *best = nil;
+    CGFloat bestD = CGFLOAT_MAX;
+    for (UIView *ind in RSV630AllIndicators()) {
+        CGRect ir = RSV630ScreenRectOfView(ind);
+        if (CGRectIsEmpty(ir)) continue;
+        CGPoint c = CGPointMake(CGRectGetMidX(ir), CGRectGetMidY(ir));
+        if (!CGRectContainsPoint(hit, c)) continue;
+        CGFloat d = hypot(c.x - CGRectGetMidX(pr), c.y - CGRectGetMidY(pr));
+        if (d < bestD) { bestD = d; best = ind; }
+    }
+    return best;
+}
+
+// 这块容器是不是“录屏药丸”：返回红点的参照视图（portal 或真红点），hideTarget 为要压制的视图
+static UIView *RSV630DotAnchorInContainer(UIView *pill, UIView **hideTarget) {
+    if (hideTarget) *hideTarget = nil;
+    if (!pill || !pill.window) return nil;
+    UIView *portal = RSV630FindDotPortal(pill, 0);
+    if (portal) {
+        if (hideTarget) *hideTarget = RSV630PortalDotView(portal);
+        return portal;
+    }
+    UIView *real = RSV630RealIndicatorInside(pill);
+    if (real) {
+        if (hideTarget) *hideTarget = real;
+        return real;
+    }
+    return nil;
+}
+
+// 把素材摆到“系统红点所在的位置”
+static BOOL RSV630PlaceEyeOnPill(UIView *pill, BOOL allowShow) {
+    if (!pill || !pill.window) return NO;
+    CGFloat pw = CGRectGetWidth(pill.bounds), ph = CGRectGetHeight(pill.bounds);
+    if (pw < 24.0 || ph < 18.0) return NO;
+
+    UIView *hideTarget = nil;
+    UIView *anchor = RSV630DotAnchorInContainer(pill, &hideTarget);
+    if (!anchor) return NO;                 // 只接管“红点确实在这块岛里”的容器
+
+    UIImageView *eye = RSEyeViewEnsure();
+    if (!eye) return NO;
+
+    CGRect ar = [anchor.superview convertRect:anchor.frame toView:pill];
+    if (CGRectIsEmpty(ar)) ar = anchor.frame;
+    BOOL right = CGRectGetMidX(ar) > (pw / 2.0);
+    CGFloat configured = right ? RSRightSize() : RSLeftSize();
+    CGFloat side = MIN(configured, ph);
+
+    if (eye.superview != pill) {
+        [eye removeFromSuperview];
+        [pill addSubview:eye];
+    }
+    [pill bringSubviewToFront:eye];
+    RSApplyMaterialForSide(eye, right);
+
+    CGPoint c = CGPointMake(CGRectGetMidX(ar), CGRectGetMidY(ar));
+    c.x += right ? RSRightXOffset() : RSLeftXOffset();
+    c.y += RSYOffset();
+    CGFloat half = side / 2.0;
+    c.x = MAX(half, MIN(pw - half, c.x));
+    c.y = MAX(half, MIN(ph - half, c.y));
+
+    [UIView performWithoutAnimation:^{
+        eye.bounds = CGRectMake(0, 0, side, side);
+        eye.center = c;
+    }];
+    eye.layer.cornerRadius = 0.0;
+    eye.clipsToBounds = NO;
+    eye.layer.masksToBounds = NO;
+    if (![eye.layer animationForKey:@"rs.rotation"]) RSStartRotation(eye);
+    if (allowShow || !RSEyeResumeVisibilityPending) {
+        if (eye.hidden) eye.hidden = NO;
+        if (eye.alpha < 0.01) eye.alpha = 1.0;
+    }
+
+    RSEyeHostElement = pill;
+    RSEyeGeometryRight = right;
+    RSEyeGeometryHasSide = YES;
+    RSIslandStickyPill = pill;
+
+    // 压住这块岛里的红点；别处的副本（日志里 x≈415 那个）还原，避免“红点还在”
+    if (hideTarget) {
+        if (RSNativeRecordingIndicatorView && RSNativeRecordingIndicatorView != hideTarget) {
+            RSV73RestoreNativeIndicator();
+        }
+        if (RSHideNativeRedEnabled()) {
+            RSV73HideNativeIndicator(hideTarget);
+            RSNativeRecordingIndicatorView = hideTarget;
+            RSNativeIndicatorHost = hideTarget.superview;
+        }
+    }
+
+    static NSTimeInterval lastLog = 0;
+    static __weak UIView *lastPill = nil;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (lastPill != pill || now - lastLog > 2.0) {
+        lastPill = pill;
+        lastLog = now;
+        RSLog(@"[V7.11.9.4.3.2.6.30] eye anchored to dot anchor=%@ side=%@ pill=%@ center={%.2f,%.2f} size=%.2f",
+              NSStringFromClass(anchor.class), right ? @"right" : @"left",
+              NSStringFromCGRect(pill.bounds), c.x, c.y, side);
+    }
+    return YES;
+}
+
+// 全屏扫描：哪块药丸里画着红点
+static UIView *RSV630PillWithDot(void) {
+    static __weak UIView *cachedPill = nil;
+    static NSTimeInterval cachedAt = 0;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (cachedPill && cachedPill.window && now - cachedAt < 0.10) return cachedPill;
+    UIView *best = nil;
+    CGFloat bestArea = CGFLOAT_MAX;
+    @try {
+        for (UIWindow *w in RSAllApplicationWindows()) {
+            NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+            NSInteger guard = 0;
+            while (stack.count && guard++ < 900) {
+                UIView *v = stack.lastObject;
+                [stack removeLastObject];
+                if ([NSStringFromClass(v.class) isEqualToString:@"SBSystemApertureContainerView"] &&
+                    v.window && !v.hidden && v.alpha > 0.01) {
+                    CGFloat cw = CGRectGetWidth(v.bounds), ch = CGRectGetHeight(v.bounds);
+                    if (cw >= 40.0 && cw <= 300.0 && ch >= 24.0 && ch <= 50.0) {
+                        if (RSV630DotAnchorInContainer(v, NULL)) {
+                            CGFloat area = cw * ch;
+                            if (area < bestArea) { bestArea = area; best = v; }
+                        }
+                    }
+                }
+                for (UIView *sub in v.subviews) [stack addObject:sub];
+            }
+        }
+    } @catch (...) {}
+    cachedPill = best;
+    cachedAt = now;
+    return best;
+}
+
+// 统一入口：几何驱动 + layoutSubviews 都走这里
+static BOOL RSV630TryDotPlacement(void) {
+    if (!RSRecordingActive || RSCaptureStopPending || !RSIsEnabled()) return NO;
+    UIView *pill = RSV630PillWithDot();
+    if (!pill) return NO;
+    return RSV630PlaceEyeOnPill(pill, YES);
+}
+
+// layoutSubviews 里只做“排队”，避免在布局事务里改子树
+static BOOL RSV630PlaceScheduled = NO;
+static __weak UIView *RSV630PendingPill = nil;
+
+static void RSV630SchedulePlaceFromContainer(UIView *v) {
+    if (!v || !v.window || !RSRecordingActive || RSCaptureStopPending || !RSIsEnabled()) return;
+    CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
+    if (w < 40.0 || w > 300.0 || h < 24.0 || h > 50.0) return;
+    UIView *hide = nil;
+    UIView *anchor = RSV630DotAnchorInContainer(v, &hide);
+    if (!anchor) return;
+    RSV630PendingPill = v;
+    if (RSV630PlaceScheduled) return;
+    RSV630PlaceScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        RSV630PlaceScheduled = NO;
+        UIView *pill = RSV630PendingPill;
+        if (!pill || !pill.window) return;
+        @try { RSV630PlaceEyeOnPill(pill, YES); } @catch (...) {}
+    });
 }
 
 // 位置同步：监听 SAUIElementView frame/center/layout，写轮眼跟随宿主
@@ -2401,6 +2677,9 @@ static BOOL RSContainerGeometryIsAnimating(UIView *container) {
 }
 
 static void RSUpdateEyeGeometry(void) {
+    // V7.11.9.4.3.2.6.30：只要“红点所在的药丸”存在，就直接按红点位置摆放并返回。
+    // 不走后面的元素/容器/右侧 morph 抑制链，避免素材被藏起来或跑到黑背板下面。
+    if (RSV630TryDotPlacement()) return;
     // V6.0.0：元素挂载模式下几何由元素子树驱动（宿主跟随系统 morph），不再把 eye 拽回 UIWindow。
     // 放在容器判空之前：元素内 provided 容器被系统重建导致弱引用失效时，逐帧同步仍由元素 hook 驱动。
     if (RSEyeMountedInElement) {
@@ -3713,6 +3992,9 @@ static void RSIslandForceApplyNow(NSString *reason) {
     if (RSInitialized && RSRecordingActive && !RSCaptureStopPending) {
         RSV71187SchedulePresentationMigration(@"container-layout");
     }
+    // V7.11.9.4.3.2.6.30：每次布局都重新贴一次（跳舞就是这么干的），
+    // 系统重建黑背板/换 frame 后素材不会被盖到下面。
+    @try { RSV630SchedulePlaceFromContainer((UIView *)self); } @catch (...) {}
 }
 - (void)didMoveToWindow {
     %orig;
