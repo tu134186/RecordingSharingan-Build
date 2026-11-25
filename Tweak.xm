@@ -2067,6 +2067,9 @@ static NSInteger RSProbeStatNoDot = 0;
 static NSInteger RSProbeStatDotOff = 0;
 static NSInteger RSProbeStatJudged = 0;
 static NSInteger RSProbeStatEyeHidden = 0;
+static dispatch_source_t RSProbeTimer = nil;
+static __weak UIView *RSProbeLastElement = nil;
+static NSTimeInterval RSProbeGraceUntil = 0;
 
 static NSString *RSProbeTime(NSTimeInterval t) {
     if (t <= 0) return @"--:--:--";
@@ -2251,9 +2254,22 @@ static void RSProbeAuditPrefs(UIImageView *eye) {
 
 static void RSProbeJudge(UIView *element) {
     UIImageView *eye = RSSharinganView;
-    if (!element || !eye) { RSProbeStatNoEye++; return; }
+    UIView *el = element ?: RSProbeLastElement;
+    NSTimeInterval wallNow = [[NSDate date] timeIntervalSince1970];
 
-    UIView *dot = RSV622BestDotForElement(element);
+    // 录屏刚启动的头几秒素材还在创建，属于正常，不判
+    if (wallNow < RSProbeGraceUntil) return;
+
+    // 录屏开着，素材必须存在。不存在就是「没挂上去」——这是用户最常遇到的故障。
+    if (!eye) {
+        RSProbeStatNoEye++;
+        RSProbeAppend(RSProbeKindMissing, @"素材没挂上去",
+                      @"录屏已经开着，但素材对象根本不存在——这段时间岛上只剩系统红点",
+                      RSProbeContext(el, nil, nil));
+        return;
+    }
+
+    UIView *dot = RSV622BestDotForElement(el);
     if (!dot || !dot.window) {
         RSProbeStatNoDot++;
         if (RSProbeStatNoDot > 3) {
@@ -2388,7 +2404,7 @@ static NSString *RSProbeRender(BOOL final_) {
     [out appendFormat:@"开始：%@\n", RSProbeTime(RSProbeStartWall)];
     [out appendFormat:@"%@：%@\n", final_ ? @"结束" : @"更新于",
      RSProbeTime(final_ ? RSProbeStopWall : [[NSDate date] timeIntervalSince1970])];
-    [out appendFormat:@"一共检查了 %ld 次（每秒一次）\n\n", (long)RSProbeSamples];
+    [out appendFormat:@"一共检查了 %ld 次（独立定时器，每秒一次）\n\n", (long)RSProbeSamples];
 
     NSMutableArray *prefLine = [NSMutableArray array];
     for (NSString *k in RSProbePrefKeys()) {
@@ -2466,6 +2482,9 @@ static void RSProbeFlush(BOOL final_) {
     });
 }
 
+static void RSProbeStartTimer(void);
+static void RSProbeStopTimer(void);
+
 static void RSProbeBegin(void) {
     RSProbeOpen = [NSMutableDictionary dictionary];
     RSProbeDone = [NSMutableArray array];
@@ -2484,11 +2503,15 @@ static void RSProbeBegin(void) {
     RSProbeStopWall = 0;
     RSProbeLastFlush = CACurrentMediaTime();
     RSProbeFile = [NSString stringWithFormat:@"/var/mobile/RS-report-%@.txt", RSProbeStamp()];
-    RSLog(@"[V6.23] probe begin %@", RSProbeFile);
+    RSProbeGraceUntil = RSProbeStartWall + 4.0;
+    RSProbeLastElement = nil;
+    RSProbeStartTimer();
+    RSLog(@"[V6.24] probe begin %@", RSProbeFile);
 }
 
 static void RSProbeFinish(void) {
     if (!RSProbeFile) return;
+    RSProbeStopTimer();
     RSProbeStopWall = [[NSDate date] timeIntervalSince1970];
     RSProbeFlush(YES);
     RSLog(@"[V6.23] probe finish samples=%ld issues=%lu prefs=%lu -> %@",
@@ -2497,22 +2520,46 @@ static void RSProbeFinish(void) {
     RSProbeFile = nil;
 }
 
+// 同步链路只负责告诉探针「当前绑定的元素是谁」。
+// 真正的判定由独立定时器驱动 —— 即使同步链路中途失效（素材被换宿主、元素重建、
+// mount 状态被清掉），探针照样每秒看一眼，把「素材不见了」记下来。
 static void RSProbeTick(UIView *element) {
-    if (!RSRecordingActive || !RSProbeFile) return;
-    NSTimeInterval now = CACurrentMediaTime();
-    if (now - RSProbeLastTick < 1.0) return;
-    RSProbeLastTick = now;
+    if (element) RSProbeLastElement = element;
+}
+
+static void RSProbePulse(void) {
+    if (!RSProbeFile) return;
     RSProbeSamples++;
     RSProbeStatTicks++;
+    NSTimeInterval mono = CACurrentMediaTime();
     @try {
         RSProbeCloseStale();
         RSProbeAuditPrefs(RSSharinganView);
-        if (element) RSProbeJudge(element);
-        if (now - RSProbeLastFlush > 20.0) {
-            RSProbeLastFlush = now;
+        RSProbeJudge(nil);
+        if (mono - RSProbeLastFlush > 20.0) {
+            RSProbeLastFlush = mono;
             RSProbeFlush(NO);
         }
     } @catch (...) {}
+}
+
+static void RSProbeStartTimer(void) {
+    if (RSProbeTimer) return;
+    RSProbeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                          dispatch_get_main_queue());
+    if (!RSProbeTimer) return;
+    dispatch_source_set_timer(RSProbeTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                              (uint64_t)NSEC_PER_SEC,
+                              (uint64_t)(100 * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(RSProbeTimer, ^{ RSProbePulse(); });
+    dispatch_resume(RSProbeTimer);
+}
+
+static void RSProbeStopTimer(void) {
+    if (!RSProbeTimer) return;
+    dispatch_source_cancel(RSProbeTimer);
+    RSProbeTimer = nil;
 }
 
 // 位置同步：优先使用系统左右 TransformView 内的 Provided 容器，旧路径仅作兼容回退。
