@@ -1967,7 +1967,7 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
     if (CGRectIsEmpty(dotScreen)) { RSV622AnchoredActive = NO; return NO; }
     RSV622AnchoredActive = YES;
     CGPoint dotCenterScreen = CGPointMake(CGRectGetMidX(dotScreen), CGRectGetMidY(dotScreen));
-    BOOL right = RSV622ScreenRight(dotCenterScreen);
+    BOOL right = RSV622ScreenRight(dotCenterScreen.x);
 
     // 真实红点位置就是侧别的唯一真相，覆盖 6.21 那个会在 morph 中锁死的缓存。
     RSVisualSideRight = right;
