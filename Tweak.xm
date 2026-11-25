@@ -1953,7 +1953,21 @@ static void RSV622RestoreDots(void) {
 // 所以：找到那个窄 accessory，再往上找药丸容器，把素材挂进药丸、对齐 accessory 中心。
 // 这样素材永远有整颗药丸的高度可用，不会被 26×22 的窄格子压扁。
 // ---------------------------------------------------------------------------
+static __weak UIView *RSV628StickyAccessory = nil;
+
 static UIView *RSV628RecordingAccessory(void) {
+    // 迟滞：上一帧选中的 accessory 还在屏幕上、尺寸也合理，就继续用它。
+    // morph 过程中系统会不停重建 accessory，没有迟滞的话素材会来回横跳。
+    UIView *sticky = RSV628StickyAccessory;
+    if (sticky && sticky.window) {
+        CGRect sr = RSV622ScreenRect(sticky);
+        CGFloat w = CGRectGetWidth(sr), h = CGRectGetHeight(sr);
+        if (!CGRectIsEmpty(sr) && w >= 8.0 && h >= 12.0 &&
+            CGRectIntersectsRect(sr, [UIScreen mainScreen].bounds)) {
+            return sticky;
+        }
+    }
+
     NSMutableArray<UIView *> *cands = [NSMutableArray array];
     CGRect screen = [UIScreen mainScreen].bounds;
     for (UIWindow *window in RSAllApplicationWindows()) {
@@ -1981,6 +1995,7 @@ static UIView *RSV628RecordingAccessory(void) {
         CGFloat x = CGRectGetMidX(RSV622ScreenRect(v));
         if (x < bestX) { bestX = x; best = v; }
     }
+    if (best) RSV628StickyAccessory = best;
     return best;
 }
 
@@ -2309,11 +2324,7 @@ static NSString *RSProbeTime(NSTimeInterval t) {
     return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
 }
 
-static NSString *RSProbeStamp(void) {
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"yyyyMMdd-HHmmss";
-    return [df stringFromDate:[NSDate date]];
-}
+// 报告固定写到 /var/mobile/RS-report.txt，每次录屏覆盖上一份。
 
 // 出错当时的环境，原样抄下来，方便事后定位（人看得懂，机器也能 grep）
 static NSString *RSProbeContext(UIView *element, UIView *dot, UIView *eye) {
@@ -2743,7 +2754,8 @@ static void RSProbeBegin(void) {
     RSProbeStartWall = [[NSDate date] timeIntervalSince1970];
     RSProbeStopWall = 0;
     RSProbeLastFlush = CACurrentMediaTime();
-    RSProbeFile = [NSString stringWithFormat:@"/var/mobile/RS-report-%@.txt", RSProbeStamp()];
+    // 固定文件名：每次录屏覆盖上一份，不会越积越多
+    RSProbeFile = @"/var/mobile/RS-report.txt";
     RSProbeGraceUntil = RSProbeStartWall + 4.0;
     RSProbeLastElement = nil;
     RSProbeStructSnaps = [NSMutableArray array];
@@ -2755,6 +2767,7 @@ static void RSProbeBegin(void) {
 static void RSProbeFinish(void) {
     if (!RSProbeFile) return;
     RSProbeStopTimer();
+    RSV628StickyAccessory = nil;
     RSProbeStopWall = [[NSDate date] timeIntervalSince1970];
     RSProbeFlush(YES);
     RSLog(@"[V6.23] probe finish samples=%ld issues=%lu prefs=%lu -> %@",
