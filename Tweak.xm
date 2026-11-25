@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
@@ -629,8 +630,11 @@ static void RSRestoreRedLeaves(UIView *root) {
 }
 
 static void RSV622RestoreDots(void);
+static void RSProbeBegin(void);
+static void RSProbeFinish(void);
 
 static void RSRemoveSharingan(void) {
+    RSProbeFinish();
     RSRedSuppressionGeneration++;
     RSV622AnchoredActive = NO;
     RSV622CachedDot = nil;
@@ -2020,12 +2024,465 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
     }
     return YES;
 }
+// ============================================================================
+// V7.11.9.4.3.2.6.23  自动检测探针（RSProbe）
+//
+// 用户不需要会描述问题，插件自己把「哪里不对」记下来：
+//   1) 几何审判 —— 每秒拿系统录屏红点当标准答案，比对素材的位置 / 大小 /
+//      可见性 / 是否被遮挡 / 是否被容器裁切
+//   2) 设置审计 —— 检测用户改了哪个设置，以及改完之后素材有没有真的变化；
+//      4 秒内素材毫无变化就标 ⚠「没生效」
+//   3) 报告 —— 录屏结束时写成 /var/mobile/RS-report-YYYYMMDD-HHmmss.txt
+// ============================================================================
+
+typedef NS_ENUM(NSInteger, RSProbeKind) {
+    RSProbeKindOffset  = 1,
+    RSProbeKindSize    = 2,
+    RSProbeKindMissing = 3,
+    RSProbeKindCovered = 4,
+    RSProbeKindClipped = 5,
+};
+
+static NSMutableDictionary<NSNumber *, NSMutableDictionary *> *RSProbeOpen = nil;
+static NSMutableArray<NSMutableDictionary *> *RSProbeDone = nil;
+static NSMutableArray<NSDictionary *> *RSProbePrefLog = nil;
+static NSDictionary *RSProbeLastPrefs = nil;
+static NSString *RSProbePendingKey = nil;
+static NSString *RSProbePendingFrom = nil;
+static NSString *RSProbePendingTo = nil;
+static NSString *RSProbePendingFinger = nil;
+static BOOL RSProbePendingVisible = NO;
+static NSTimeInterval RSProbePendingAt = 0;
+static NSTimeInterval RSProbeLastTick = 0;
+static NSTimeInterval RSProbeStartWall = 0;
+static NSTimeInterval RSProbeStopWall = 0;
+static NSTimeInterval RSProbeLastFlush = 0;
+static NSInteger RSProbeSamples = 0;
+static NSString *RSProbeFile = nil;
+
+static NSString *RSProbeTime(NSTimeInterval t) {
+    if (t <= 0) return @"--:--:--";
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
+}
+
+static NSString *RSProbeStamp(void) {
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyyMMdd-HHmmss";
+    return [df stringFromDate:[NSDate date]];
+}
+
+// 出错当时的环境，原样抄下来，方便事后定位（人看得懂，机器也能 grep）
+static NSString *RSProbeContext(UIView *element, UIView *dot, UIView *eye) {
+    NSMutableString *s = [NSMutableString string];
+    CGRect er = element ? RSV622ScreenRect(element) : CGRectZero;
+    CGRect dr = dot ? RSV622ScreenRect(RSV622AnchorForDot(dot)) : CGRectZero;
+    CGRect yr = eye ? RSV622ScreenRect(eye) : CGRectZero;
+    if (element) {
+        [s appendFormat:@"    灵动岛/元素：%@  位置 (%.0f, %.0f)  大小 %.0f×%.0f\n",
+         NSStringFromClass(element.class),
+         CGRectGetMinX(er), CGRectGetMinY(er), CGRectGetWidth(er), CGRectGetHeight(er)];
+    }
+    if (dot) {
+        [s appendFormat:@"    系统红点：%@  位置 (%.0f, %.0f)  大小 %.0f×%.0f\n",
+         NSStringFromClass(dot.class),
+         CGRectGetMinX(dr), CGRectGetMinY(dr), CGRectGetWidth(dr), CGRectGetHeight(dr)];
+    }
+    if (eye) {
+        [s appendFormat:@"    我们的素材：%@  位置 (%.0f, %.0f)  大小 %.0f×%.0f  alpha=%.2f  hidden=%d\n",
+         NSStringFromClass(eye.class),
+         CGRectGetMinX(yr), CGRectGetMinY(yr), CGRectGetWidth(yr), CGRectGetHeight(yr),
+         eye.alpha, (int)eye.hidden];
+        if (eye.superview) {
+            NSUInteger idx = [eye.superview.subviews indexOfObject:eye];
+            [s appendFormat:@"    素材挂在哪：%@（第 %ld/%lu 层）\n",
+             NSStringFromClass(eye.superview.class), (long)(idx + 1),
+             (unsigned long)eye.superview.subviews.count];
+        }
+    }
+    return s;
+}
+
+// 同一种问题连续出现只记一条，合并成「持续 X 秒、出现 N 次」
+static void RSProbeAppend(RSProbeKind kind, NSString *title, NSString *detail, NSString *context) {
+    if (!RSProbeOpen) RSProbeOpen = [NSMutableDictionary dictionary];
+    if (!RSProbeDone) RSProbeDone = [NSMutableArray array];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSNumber *k = @(kind);
+    NSMutableDictionary *cur = RSProbeOpen[k];
+    if (cur && (now - [cur[@"last"] doubleValue]) < 2.0) {
+        cur[@"last"] = @(now);
+        cur[@"count"] = @([cur[@"count"] integerValue] + 1);
+        if (detail.length) cur[@"detail"] = detail;
+        return;
+    }
+    if (cur) [RSProbeDone addObject:cur];
+    RSProbeOpen[k] = [@{
+        @"kind": k,
+        @"start": @(now),
+        @"last": @(now),
+        @"count": @(1),
+        @"title": title ?: @"",
+        @"detail": detail ?: @"",
+        @"context": context ?: @"",
+    } mutableCopy];
+}
+
+static void RSProbeCloseStale(void) {
+    if (!RSProbeOpen.count) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    for (NSNumber *k in RSProbeOpen.allKeys) {
+        NSMutableDictionary *it = RSProbeOpen[k];
+        if (now - [it[@"last"] doubleValue] > 2.0) {
+            [RSProbeDone addObject:it];
+            [RSProbeOpen removeObjectForKey:k];
+        }
+    }
+}
+
+#pragma mark - 设置审计
+
+static NSArray<NSString *> *RSProbePrefKeys(void) {
+    return @[@"enabled", @"rotationSpeed", @"leftXOffset", @"rightXOffset",
+             @"yOffset", @"leftSize", @"rightSize", @"eyeStyle"];
+}
+
+static NSString *RSProbePrefName(NSString *key) {
+    if ([key isEqualToString:@"enabled"])       return @"启用插件";
+    if ([key isEqualToString:@"rotationSpeed"]) return @"旋转速度";
+    if ([key isEqualToString:@"leftXOffset"])   return @"左侧 X 偏移";
+    if ([key isEqualToString:@"rightXOffset"])  return @"右侧 X 偏移";
+    if ([key isEqualToString:@"yOffset"])       return @"上下 Y 偏移";
+    if ([key isEqualToString:@"leftSize"])      return @"左侧素材尺寸";
+    if ([key isEqualToString:@"rightSize"])     return @"右侧素材尺寸";
+    if ([key isEqualToString:@"eyeStyle"])      return @"素材选择";
+    return key;
+}
+
+static NSString *RSProbePrefValue(NSString *key) {
+    CFPropertyListRef v = RSCopyPreference((__bridge CFStringRef)key);
+    if (!v) return @"(未设置)";
+    NSString *s = @"?";
+    if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+        s = CFBooleanGetValue((CFBooleanRef)v) ? @"开" : @"关";
+    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+        double d = 0;
+        CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &d);
+        s = [NSString stringWithFormat:@"%.2f", d];
+    } else if (CFGetTypeID(v) == CFStringGetTypeID()) {
+        s = [NSString stringWithFormat:@"%@", (__bridge NSString *)v];
+    }
+    CFRelease(v);
+    return s;
+}
+
+// 素材的「外观指纹」：尺寸 + 屏幕位置 + 透明度 + 圆角 + 动画时长。
+// 故意不含旋转角度（素材一直在转，会干扰判断）。
+static NSString *RSProbeEyeFingerprint(UIImageView *eye) {
+    if (!eye) return @"(没有素材)";
+    CGRect sr = RSV622ScreenRect(eye);
+    CGFloat dur = 0;
+    for (CAAnimation *a in eye.layer.animations) {
+        if (a.duration > dur) dur = a.duration;
+    }
+    return [NSString stringWithFormat:@"%.2f×%.2f @(%.1f,%.1f) alpha=%.2f hidden=%d 圆角=%.2f 动画=%.3f",
+            CGRectGetWidth(sr), CGRectGetHeight(sr),
+            CGRectGetMidX(sr), CGRectGetMidY(sr),
+            eye.alpha, (int)eye.hidden, eye.layer.cornerRadius, dur];
+}
+
+static void RSProbeAuditPrefs(UIImageView *eye) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    // ① 结算上一次改动：4 秒观察期到了吗？素材变了吗？
+    if (RSProbePendingKey) {
+        BOOL visible = (eye && eye.window && !eye.hidden && eye.alpha > 0.5);
+        NSString *fp = RSProbeEyeFingerprint(eye);
+        if (visible) RSProbePendingVisible = YES;
+        BOOL changed = ![fp isEqualToString:(RSProbePendingFinger ?: @"")];
+        if (visible && changed) {
+            [RSProbePrefLog addObject:@{@"time": @(now), @"key": RSProbePendingKey,
+                                        @"from": RSProbePendingFrom ?: @"", @"to": RSProbePendingTo ?: @"",
+                                        @"result": @"✅ 已生效", @"before": RSProbePendingFinger ?: @"",
+                                        @"after": fp}];
+            RSProbePendingKey = nil;
+        } else if (now - RSProbePendingAt > 4.0) {
+            NSString *res = RSProbePendingVisible ? @"⚠️ 拨了没反应（可能没生效）"
+                                                  : @"（当时素材不在屏幕上，测不到）";
+            [RSProbePrefLog addObject:@{@"time": @(RSProbePendingAt), @"key": RSProbePendingKey,
+                                        @"from": RSProbePendingFrom ?: @"", @"to": RSProbePendingTo ?: @"",
+                                        @"result": res, @"before": RSProbePendingFinger ?: @"",
+                                        @"after": fp}];
+            RSProbePendingKey = nil;
+        }
+    }
+
+    // ② 读当前所有设置，和上一次比对，找出用户刚动的是哪一项
+    NSMutableDictionary *cur = [NSMutableDictionary dictionary];
+    for (NSString *k in RSProbePrefKeys()) cur[k] = RSProbePrefValue(k);
+    if (RSProbeLastPrefs && !RSProbePendingKey) {
+        for (NSString *k in cur.allKeys) {
+            NSString *old = RSProbeLastPrefs[k];
+            if (old && ![old isEqualToString:cur[k]]) {
+                RSProbePendingKey = k;
+                RSProbePendingFrom = old;
+                RSProbePendingTo = cur[k];
+                RSProbePendingAt = now;
+                RSProbePendingFinger = RSProbeEyeFingerprint(eye);
+                RSProbePendingVisible = (eye && eye.window && !eye.hidden && eye.alpha > 0.5);
+                break;
+            }
+        }
+    }
+    RSProbeLastPrefs = cur;
+}
+
+#pragma mark - 几何审判
+
+static void RSProbeJudge(UIView *element) {
+    UIImageView *eye = RSSharinganView;
+    if (!element || !eye) return;
+
+    UIView *dot = RSV622BestDotForElement(element);
+    if (!dot || !dot.window) return;
+    UIView *anchor = RSV622AnchorForDot(dot);
+    CGRect dotRect = RSV622ScreenRect(anchor);
+    if (CGRectIsEmpty(dotRect)) return;
+    if (!CGRectIntersectsRect(dotRect, [UIScreen mainScreen].bounds)) return;
+
+    // 系统红点「本来该不该亮」：我们可能把它压成了透明，取原始 alpha
+    NSNumber *origAlpha = objc_getAssociatedObject(dot, RSOriginalAlphaKey);
+    CGFloat dotAlpha = origAlpha ? origAlpha.doubleValue : dot.alpha;
+    BOOL dotShouldShow = (dotAlpha > 0.5) && !dot.hidden;
+
+    BOOL eyeVisible = (eye.window != nil) && !eye.hidden && eye.alpha > 0.5;
+
+    // ③ 存在性：红点亮着，素材却没了
+    if (dotShouldShow && !eyeVisible) {
+        NSString *why = @"素材不可见";
+        if (!eye.window) why = @"素材没有挂在任何窗口上（丢失了）";
+        else if (eye.hidden) why = @"素材被设成了隐藏（hidden=YES）";
+        else if (eye.alpha <= 0.5) why = [NSString stringWithFormat:@"素材透明度只有 %.2f", eye.alpha];
+        RSProbeAppend(RSProbeKindMissing, @"素材不见了（系统红点还在亮）", why,
+                      RSProbeContext(element, dot, eye));
+        return;
+    }
+    if (!eyeVisible) return;
+
+    CGRect eyeRect = RSV622ScreenRect(eye);
+    if (CGRectIsEmpty(eyeRect)) return;
+
+    CGPoint dotCenter = CGPointMake(CGRectGetMidX(dotRect), CGRectGetMidY(dotRect));
+    CGPoint eyeCenter = CGPointMake(CGRectGetMidX(eyeRect), CGRectGetMidY(eyeRect));
+    BOOL right = RSVisualSideRight;
+    CGFloat offX = right ? RSRightXOffset() : RSLeftXOffset();
+    CGFloat offY = RSYOffset();
+    CGFloat dx = eyeCenter.x - dotCenter.x - offX;
+    CGFloat dy = eyeCenter.y - dotCenter.y - offY;
+
+    // ① 位置：扣掉用户自己设的偏移之后，还差多少
+    if (fabs(dx) > 2.0 || fabs(dy) > 2.0) {
+        NSString *detail = [NSString stringWithFormat:
+            @"素材圆心 (%.1f, %.1f)，红点圆心 (%.1f, %.1f)\n"
+            @"    扣掉你设的位置偏移后，还多偏了 (%.1f, %.1f)",
+            eyeCenter.x, eyeCenter.y, dotCenter.x, dotCenter.y, dx, dy];
+        RSProbeAppend(RSProbeKindOffset, @"素材跑偏了", detail, RSProbeContext(element, dot, eye));
+    }
+
+    // ② 尺寸：用户设了多大，实际有多大
+    CGFloat configured = right ? RSRightSize() : RSLeftSize();
+    CGFloat actualW = CGRectGetWidth(eye.bounds);
+    if (configured > 2.0 && actualW < configured - 1.0) {
+        NSString *detail = [NSString stringWithFormat:
+            @"你设置的是 %.1f，实际只有 %.1f\n"
+            @"    最可能是被岛的高度限制住了（岛高 %.1f，素材不能比它大）",
+            configured, actualW, CGRectGetHeight(RSV622ScreenRect(anchor))];
+        RSProbeAppend(RSProbeKindSize, @"素材被压小了", detail, RSProbeContext(element, dot, eye));
+    }
+
+    UIView *parent = eye.superview;
+    if (!parent) return;
+
+    // ⑤ 裁剪：容器比素材小，露出来的部分会被切掉
+    CGRect pb = parent.bounds;
+    if (CGRectGetWidth(pb) + 0.5 < CGRectGetWidth(eye.bounds) ||
+        CGRectGetHeight(pb) + 0.5 < CGRectGetHeight(eye.bounds)) {
+        NSString *detail = [NSString stringWithFormat:
+            @"素材本身 %.0f×%.0f，但它被放进了一个只有 %.0f×%.0f 的容器\n"
+            @"    超出的部分会被切掉，看起来就是「缺角」或者「月牙」",
+            CGRectGetWidth(eye.bounds), CGRectGetHeight(eye.bounds),
+            CGRectGetWidth(pb), CGRectGetHeight(pb)];
+        RSProbeAppend(RSProbeKindClipped, @"素材被切掉了一块", detail,
+                      RSProbeContext(element, dot, eye));
+    }
+
+    // ④ 遮挡：同一父视图里排在素材后面、又盖住素材中心的不透明视图
+    NSUInteger myIdx = [parent.subviews indexOfObject:eye];
+    if (myIdx == NSNotFound) return;
+    CGRect eyeInParent = CGRectZero;
+    @try { eyeInParent = [eye convertRect:eye.bounds toView:parent]; } @catch (...) {}
+    CGPoint mid = CGPointMake(CGRectGetMidX(eyeInParent), CGRectGetMidY(eyeInParent));
+
+    for (NSUInteger i = myIdx + 1; i < parent.subviews.count; i++) {
+        UIView *sib = parent.subviews[i];
+        if (!sib || sib.hidden || sib.alpha < 0.5) continue;
+        if (!CGRectContainsPoint(sib.frame, mid)) continue;
+
+        BOOL opaque = NO;
+        UIColor *bg = sib.backgroundColor;
+        if (bg && CGColorGetAlpha(bg.CGColor) > 0.5) opaque = YES;
+        if (!opaque && sib.layer.contents) opaque = YES;
+        if (!opaque && (RSV622ClassHas(sib, @"Backdrop") || RSV622ClassHas(sib, @"Background") ||
+                        RSV622ClassHas(sib, @"Platter") || RSV622ClassHas(sib, @"Chip") ||
+                        RSV622ClassHas(sib, @"Material"))) opaque = YES;
+        if (!opaque) continue;
+
+        NSString *detail = [NSString stringWithFormat:
+            @"素材上面盖着 %@（%.0f×%.0f），它排在素材后面显示\n"
+            @"    这就是「素材只露出一小条」或者「完全看不见」的原因",
+            NSStringFromClass(sib.class),
+            CGRectGetWidth(sib.frame), CGRectGetHeight(sib.frame)];
+        RSProbeAppend(RSProbeKindCovered, @"素材被挡住了", detail,
+                      RSProbeContext(element, dot, eye));
+        break;
+    }
+}
+
+#pragma mark - 报告
+
+static NSString *RSProbeRender(BOOL final_) {
+    RSProbeCloseStale();
+
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSNumber *k in RSProbeOpen.allKeys) [items addObject:RSProbeOpen[k]];
+    [items addObjectsFromArray:RSProbeDone];
+    [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"start"] compare:b[@"start"]];
+    }];
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"==================================================\n"];
+    [out appendString:@"  录屏写轮眼 · 自动检测报告\n"];
+    [out appendString:@"==================================================\n"];
+    [out appendFormat:@"开始：%@\n", RSProbeTime(RSProbeStartWall)];
+    [out appendFormat:@"%@：%@\n", final_ ? @"结束" : @"更新于",
+     RSProbeTime(final_ ? RSProbeStopWall : [[NSDate date] timeIntervalSince1970])];
+    [out appendFormat:@"一共检查了 %ld 次（每秒一次）\n\n", (long)RSProbeSamples];
+
+    NSMutableArray *prefLine = [NSMutableArray array];
+    for (NSString *k in RSProbePrefKeys()) {
+        [prefLine addObject:[NSString stringWithFormat:@"%@=%@", RSProbePrefName(k), RSProbePrefValue(k)]];
+    }
+    [out appendFormat:@"当前设置：%@\n\n", [prefLine componentsJoinedByString:@"  "]];
+
+    [out appendString:@"──────── 一、设置改动记录 ────────\n"];
+    if (!RSProbePrefLog.count) {
+        [out appendString:@"（这次全程没有改动任何设置）\n"];
+    } else {
+        NSInteger n = 1;
+        for (NSDictionary *e in RSProbePrefLog) {
+            [out appendFormat:@"%ld) %@  %@：%@ → %@\n",
+             (long)n++, RSProbeTime([e[@"time"] doubleValue]),
+             RSProbePrefName(e[@"key"]), e[@"from"], e[@"to"]];
+            [out appendFormat:@"   结果：%@\n", e[@"result"]];
+            if ([e[@"result"] hasPrefix:@"⚠️"]) {
+                [out appendFormat:@"   改之前素材：%@\n", e[@"before"]];
+                [out appendFormat:@"   改之后素材：%@\n", e[@"after"]];
+            }
+        }
+    }
+    [out appendString:@"\n"];
+
+    [out appendString:@"──────── 二、素材问题 ────────\n"];
+    if (!items.count) {
+        [out appendString:@"没有发现位置 / 大小 / 遮挡 / 裁剪方面的问题。\n"];
+    } else {
+        [out appendFormat:@"发现 %ld 个问题：\n\n", (long)items.count];
+        NSInteger n = 1;
+        for (NSDictionary *it in items) {
+            NSTimeInterval s = [it[@"start"] doubleValue];
+            NSTimeInterval l = [it[@"last"] doubleValue];
+            [out appendFormat:@"【问题 %ld】%@ ~ %@（持续 %.0f 秒，出现 %ld 次）\n",
+             (long)n++, RSProbeTime(s), RSProbeTime(l), l - s,
+             (long)[it[@"count"] integerValue]];
+            [out appendFormat:@"    %@\n", it[@"title"]];
+            [out appendFormat:@"    %@\n", it[@"detail"]];
+            NSString *ctx = it[@"context"];
+            if (ctx.length) {
+                [out appendString:@"    —— 当时的情况 ——\n"];
+                [out appendString:ctx];
+            }
+            [out appendString:@"\n"];
+        }
+    }
+
+    [out appendString:@"==================================================\n"];
+    [out appendString:@"把这个文件发给 Minis 就行。\n"];
+    return out;
+}
+
+static void RSProbeFlush(BOOL final_) {
+    if (!RSProbeFile) return;
+    NSString *text = RSProbeRender(final_);
+    NSString *path = [RSProbeFile copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @try {
+            [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            chmod([path fileSystemRepresentation], 0644);
+        } @catch (...) {}
+    });
+}
+
+static void RSProbeBegin(void) {
+    RSProbeOpen = [NSMutableDictionary dictionary];
+    RSProbeDone = [NSMutableArray array];
+    RSProbePrefLog = [NSMutableArray array];
+    RSProbeLastPrefs = nil;
+    RSProbePendingKey = nil;
+    RSProbeLastTick = 0;
+    RSProbeSamples = 0;
+    RSProbeStartWall = [[NSDate date] timeIntervalSince1970];
+    RSProbeStopWall = 0;
+    RSProbeLastFlush = CACurrentMediaTime();
+    RSProbeFile = [NSString stringWithFormat:@"/var/mobile/RS-report-%@.txt", RSProbeStamp()];
+    RSLog(@"[V6.23] probe begin %@", RSProbeFile);
+}
+
+static void RSProbeFinish(void) {
+    if (!RSProbeFile) return;
+    RSProbeStopWall = [[NSDate date] timeIntervalSince1970];
+    RSProbeFlush(YES);
+    RSLog(@"[V6.23] probe finish samples=%ld issues=%lu prefs=%lu -> %@",
+          (long)RSProbeSamples, (unsigned long)RSProbeDone.count,
+          (unsigned long)RSProbePrefLog.count, RSProbeFile);
+    RSProbeFile = nil;
+}
+
+static void RSProbeTick(UIView *element) {
+    if (!RSRecordingActive || !RSProbeFile) return;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - RSProbeLastTick < 1.0) return;
+    RSProbeLastTick = now;
+    RSProbeSamples++;
+    @try {
+        RSProbeCloseStale();
+        RSProbeAuditPrefs(RSSharinganView);
+        if (element) RSProbeJudge(element);
+        if (now - RSProbeLastFlush > 20.0) {
+            RSProbeLastFlush = now;
+            RSProbeFlush(NO);
+        }
+    } @catch (...) {}
+}
+
 // 位置同步：优先使用系统左右 TransformView 内的 Provided 容器，旧路径仅作兼容回退。
 static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     if (!RSRecordingActive || RSCaptureStopPending || ![UIScreen mainScreen].isCaptured) return;
     if (!RSEyeMountedInElement || !RSEyeMountedElement || RSEyeMountedElement != element) return;
     UIImageView *eye = RSSharinganView;
     if (!eye || !element.window) return;
+    RSProbeTick(element);
 
     // V7.11.9.4.3.2.6.22：红点锚定优先 —— 素材圆心严格等于系统红点圆心，侧别也照抄红点。
     if (RSV622DotAnchoredPlacement(element, allowShow)) return;
@@ -3232,6 +3689,7 @@ static void RSUpdateRecordingState(void) {
         RSLog(@"recording state 0 -> 1");
         RSLog(@"[V7.11.8.4] SESSION ON detected -> schedule FORCE REMOUNT");
         RSRecordingActive = YES;
+        RSProbeBegin();
         RSCaptureStopPending = NO;
         RSCancelCaptureResumeConfirmation();
         RSCaptureStopStartedAt = 0;
