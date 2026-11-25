@@ -2091,6 +2091,19 @@ static BOOL RSV628AccessoryAnchoredPlacement(UIView *element, BOOL allowShow) {
 // 系统改过红点的类名、或者把红点塞进 portal 的 sourceView 时，类名扫描会全军覆没。
 // 这里直接在屏幕顶部区域里找「红色的小方块/圆点」，作为最后的兜底。
 // ---------------------------------------------------------------------------
+static const void *RSProbeDotScreenRectKey = &RSProbeDotScreenRectKey;
+
+// 红点真正的屏幕位置：自己挂在窗口上就用自己；
+// 如果它是某个 Portal 的 sourceView（window 为 nil，拿不到坐标），就用那个 Portal 的位置。
+// —— 这就是之前颜色扫描一直漏掉系统红点的原因：它被 portal 渲染，window 是空的。
+static CGRect RSProbeDotScreenRect(UIView *dot) {
+    if (!dot) return CGRectZero;
+    CGRect r = RSV622ScreenRect(dot);
+    if (!CGRectIsEmpty(r)) return r;
+    NSValue *v = objc_getAssociatedObject(dot, RSProbeDotScreenRectKey);
+    return v ? v.CGRectValue : CGRectZero;
+}
+
 static NSArray<UIView *> *RSProbeScanRedDots(void) {
     NSMutableArray<UIView *> *raw = [NSMutableArray array];
     CGRect screen = [UIScreen mainScreen].bounds;
@@ -2098,27 +2111,36 @@ static NSArray<UIView *> *RSProbeScanRedDots(void) {
         if (!window) continue;
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
         NSInteger guard = 0;
-        while (stack.count && guard++ < 1500) {
+        while (stack.count && guard++ < 1800) {
             UIView *v = stack.lastObject;
             [stack removeLastObject];
             if (!v || v == RSSharinganView) continue;
-            if (v.window && !v.hidden && v.alpha > 0.05) {
+
+            CGRect sr = RSProbeDotScreenRect(v);
+            if (!v.hidden && v.alpha > 0.02 && !CGRectIsEmpty(sr) &&
+                CGRectIntersectsRect(sr, screen) && CGRectGetMinY(sr) < 150.0) {
                 CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
-                if (w >= 2.0 && h >= 2.0 && w <= 40.0 && h <= 40.0) {
-                    CGRect sr = RSV622ScreenRect(v);
-                    if (!CGRectIsEmpty(sr) && CGRectIntersectsRect(sr, screen) &&
-                        CGRectGetMinY(sr) < 140.0 && RSRedScoreInView(v, 0) >= 50) {
-                        [raw addObject:v];
-                    }
+                if (w >= 3.0 && h >= 3.0 && w <= 40.0 && h <= 40.0) {
+                    NSInteger score = RSRedScoreInView(v, 0);
+                    if ([v isKindOfClass:[UIImageView class]]) score += 30;
+                    if (score >= 25) [raw addObject:v];
                 }
             }
+
             if (RSV622ClassHas(v, @"Portal")) {
                 UIView *src = nil;
                 @try {
                     id sv = [v valueForKey:@"sourceView"];
                     if ([sv isKindOfClass:[UIView class]]) src = (UIView *)sv;
                 } @catch (...) {}
-                if (src) [stack addObject:src];
+                CGRect pr = RSV622ScreenRect(v);
+                if (src && !CGRectIsEmpty(pr)) {
+                    // portal 显示到哪儿，它里面的红点就在哪儿
+                    objc_setAssociatedObject(src, RSProbeDotScreenRectKey,
+                                             [NSValue valueWithCGRect:pr],
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    [stack addObject:src];
+                }
             }
             for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
         }
@@ -2135,6 +2157,20 @@ static NSArray<UIView *> *RSProbeScanRedDots(void) {
     return out;
 }
 
+// 判断「这个红点是不是假的」：App 图标角标（SBIconBadgeView / SBDarkeningImageView）
+// 会被误认成录屏红点，必须排除，否则锚定逻辑会拿它当标尺。
+static BOOL RSV631LooksFakeDot(UIView *dot) {
+    if (!dot) return YES;
+    NSString *cls = NSStringFromClass(dot.class);
+    if ([cls rangeOfString:@"Darkening"].location != NSNotFound) return YES;
+    if ([cls rangeOfString:@"IconBadge"].location != NSNotFound) return YES;
+    NSInteger hops = 0;
+    for (UIView *p = dot.superview; p && hops++ < 6; p = p.superview) {
+        if (RSV622ClassHas(p, @"IconBadge") || RSV622ClassHas(p, @"SBIconView")) return YES;
+    }
+    return NO;
+}
+
 // 从候选里挑最像「系统录屏红点」的那个：接近方形、直径 12pt 左右、落在录屏元素内、靠左
 static UIView *RSProbeBestRedDot(UIView *element) {
     NSArray<UIView *> *reds = RSProbeScanRedDots();
@@ -2143,7 +2179,7 @@ static UIView *RSProbeBestRedDot(UIView *element) {
     UIView *best = nil;
     CGFloat bestScore = -1e9;
     for (UIView *v in reds) {
-        CGRect r = RSV622ScreenRect(v);
+        CGRect r = RSProbeDotScreenRect(v);
         CGFloat w = CGRectGetWidth(r), h = CGRectGetHeight(r);
         if (w <= 0 || h <= 0) continue;
         CGFloat score = 0.0;
@@ -2163,7 +2199,7 @@ static NSString *RSProbeCandidateText(void) {
     NSInteger n = 0;
     for (UIView *v in reds) {
         if (n++ >= 6) { [s appendString:@"    …\n"]; break; }
-        CGRect r = RSV622ScreenRect(v);
+        CGRect r = RSProbeDotScreenRect(v);
         [s appendFormat:@"      · %@  (%.0f, %.0f)  %.1f×%.1f  alpha=%.2f\n",
          NSStringFromClass(v.class), CGRectGetMidX(r), CGRectGetMidY(r),
          CGRectGetWidth(r), CGRectGetHeight(r), v.alpha];
@@ -2176,20 +2212,22 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
     UIImageView *eye = RSSharinganView;
     if (!eye || !element || !element.window) return NO;
 
-    // 6.29：accessory 锚定优先。
-    // 这台系统的红点类名不含 RecordingIndicator，类名扫描会把 App 图标角标
-    // （SBDarkeningImageView / SBIconBadgeView）当成红点，全程都是错的。
-    // 而「录屏装饰 accessory」的结构位置是稳定的（始终在岛最左端、宽 17~26pt），
-    // 所以直接走这条不依赖红点的路。
-    if (RSV628AccessoryAnchoredPlacement(element, allowShow)) return YES;
-
+    // 6.31：红点优先（portal 渲染的红点现在能拿到屏幕位置了），accessory 只作兜底。
+    // 类名扫描拿到的 App 图标角标（SBDarkeningImageView / SBIconBadgeView）必须丢掉。
     UIView *dot = RSV622FastDot(element);
-    if (!dot || !dot.window) {
+    if (dot && RSV631LooksFakeDot(dot)) dot = nil;
+    if (!dot) {
         dot = RSProbeBestRedDot(element);
+        if (dot && RSV631LooksFakeDot(dot)) dot = nil;
         if (dot) { RSV622CachedDot = dot; RSV622CachedDotAt = CACurrentMediaTime(); }
     }
-    if (!dot || !dot.window) {
-        // 6.28：红点彻底找不到时，改用「录屏装饰 accessory」定位，不再退回猜侧别
+    if (!dot) {
+        // 红点彻底找不到时，改用「录屏装饰 accessory」定位，不再退回猜侧别
+        if (RSV628AccessoryAnchoredPlacement(element, allowShow)) return YES;
+        RSV622AnchoredActive = NO;
+        return NO;
+    }
+    if (!dot.window && CGRectIsEmpty(RSProbeDotScreenRect(dot))) {
         if (RSV628AccessoryAnchoredPlacement(element, allowShow)) return YES;
         RSV622AnchoredActive = NO;
         return NO;
@@ -2211,7 +2249,8 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
     }
 
     UIView *dotAnchor = RSV622AnchorForDot(dot);
-    CGRect dotScreen = RSV622ScreenRect(dotAnchor);
+    CGRect dotScreen = RSProbeDotScreenRect(dot);
+    if (CGRectIsEmpty(dotScreen)) dotScreen = RSV622ScreenRect(dotAnchor);
     if (CGRectIsEmpty(dotScreen)) { RSV622AnchoredActive = NO; return NO; }
     RSV622AnchoredActive = YES;
     CGPoint dotCenterScreen = CGPointMake(CGRectGetMidX(dotScreen), CGRectGetMidY(dotScreen));
