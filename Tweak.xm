@@ -2183,8 +2183,9 @@ static NSString *RSProbeEyeFingerprint(UIImageView *eye) {
     if (!eye) return @"(没有素材)";
     CGRect sr = RSV622ScreenRect(eye);
     CGFloat dur = 0;
-    for (CAAnimation *a in eye.layer.animations) {
-        if (a.duration > dur) dur = a.duration;
+    for (NSString *animKey in eye.layer.animationKeys) {
+        CAAnimation *anim = [eye.layer animationForKey:animKey];
+        if (anim.duration > dur) dur = anim.duration;
     }
     return [NSString stringWithFormat:@"%.2f×%.2f @(%.1f,%.1f) alpha=%.2f hidden=%d 圆角=%.2f 动画=%.3f",
             CGRectGetWidth(sr), CGRectGetHeight(sr),
