@@ -2041,6 +2041,7 @@ typedef NS_ENUM(NSInteger, RSProbeKind) {
     RSProbeKindMissing = 3,
     RSProbeKindCovered = 4,
     RSProbeKindClipped = 5,
+    RSProbeKindNoDot   = 6,
 };
 
 static NSMutableDictionary<NSNumber *, NSMutableDictionary *> *RSProbeOpen = nil;
@@ -2059,6 +2060,13 @@ static NSTimeInterval RSProbeStopWall = 0;
 static NSTimeInterval RSProbeLastFlush = 0;
 static NSInteger RSProbeSamples = 0;
 static NSString *RSProbeFile = nil;
+// 自检：探针自己有没有真的在判，而不是静默跳过
+static NSInteger RSProbeStatTicks = 0;
+static NSInteger RSProbeStatNoEye = 0;
+static NSInteger RSProbeStatNoDot = 0;
+static NSInteger RSProbeStatDotOff = 0;
+static NSInteger RSProbeStatJudged = 0;
+static NSInteger RSProbeStatEyeHidden = 0;
 
 static NSString *RSProbeTime(NSTimeInterval t) {
     if (t <= 0) return @"--:--:--";
@@ -2243,14 +2251,25 @@ static void RSProbeAuditPrefs(UIImageView *eye) {
 
 static void RSProbeJudge(UIView *element) {
     UIImageView *eye = RSSharinganView;
-    if (!element || !eye) return;
+    if (!element || !eye) { RSProbeStatNoEye++; return; }
 
     UIView *dot = RSV622BestDotForElement(element);
-    if (!dot || !dot.window) return;
+    if (!dot || !dot.window) {
+        RSProbeStatNoDot++;
+        if (RSProbeStatNoDot > 3) {
+            RSProbeAppend(RSProbeKindNoDot, @"探针找不到系统红点",
+                          @"没有标尺就没法判断素材位置对不对——这时候素材位置只能靠猜，很容易跑偏",
+                          RSProbeContext(element, nil, eye));
+        }
+        return;
+    }
     UIView *anchor = RSV622AnchorForDot(dot);
     CGRect dotRect = RSV622ScreenRect(anchor);
-    if (CGRectIsEmpty(dotRect)) return;
-    if (!CGRectIntersectsRect(dotRect, [UIScreen mainScreen].bounds)) return;
+    if (CGRectIsEmpty(dotRect) || !CGRectIntersectsRect(dotRect, [UIScreen mainScreen].bounds)) {
+        RSProbeStatDotOff++;
+        return;
+    }
+    RSProbeStatJudged++;
 
     // 系统红点「本来该不该亮」：我们可能把它压成了透明，取原始 alpha
     NSNumber *origAlpha = objc_getAssociatedObject(dot, RSOriginalAlphaKey);
@@ -2269,7 +2288,7 @@ static void RSProbeJudge(UIView *element) {
                       RSProbeContext(element, dot, eye));
         return;
     }
-    if (!eyeVisible) return;
+    if (!eyeVisible) { RSProbeStatEyeHidden++; return; }
 
     CGRect eyeRect = RSV622ScreenRect(eye);
     if (CGRectIsEmpty(eyeRect)) return;
@@ -2377,6 +2396,18 @@ static NSString *RSProbeRender(BOOL final_) {
     }
     [out appendFormat:@"当前设置：%@\n\n", [prefLine componentsJoinedByString:@"  "]];
 
+    [out appendString:@"──────── 〇、探针自检 ────────\n"];
+    [out appendFormat:@"检查 %ld 次，其中真正完成比对的 %ld 次\n",
+     (long)RSProbeStatTicks, (long)RSProbeStatJudged];
+    if (RSProbeStatNoEye)     [out appendFormat:@"  · 素材不存在（没创建/已销毁）：%ld 次\n", (long)RSProbeStatNoEye];
+    if (RSProbeStatNoDot)     [out appendFormat:@"  · 找不到系统红点（无法判定位置）：%ld 次\n", (long)RSProbeStatNoDot];
+    if (RSProbeStatDotOff)    [out appendFormat:@"  · 红点在屏幕外：%ld 次\n", (long)RSProbeStatDotOff];
+    if (RSProbeStatEyeHidden) [out appendFormat:@"  · 红点没亮，素材也没显示：%ld 次\n", (long)RSProbeStatEyeHidden];
+    if (RSProbeStatJudged == 0) {
+        [out appendString:@"\n⚠️ 一次有效比对都没做成，下面的「没发现问题」不可信。\n"];
+    }
+    [out appendString:@"\n"];
+
     [out appendString:@"──────── 一、设置改动记录 ────────\n"];
     if (!RSProbePrefLog.count) {
         [out appendString:@"（这次全程没有改动任何设置）\n"];
@@ -2443,6 +2474,12 @@ static void RSProbeBegin(void) {
     RSProbePendingKey = nil;
     RSProbeLastTick = 0;
     RSProbeSamples = 0;
+    RSProbeStatTicks = 0;
+    RSProbeStatNoEye = 0;
+    RSProbeStatNoDot = 0;
+    RSProbeStatDotOff = 0;
+    RSProbeStatJudged = 0;
+    RSProbeStatEyeHidden = 0;
     RSProbeStartWall = [[NSDate date] timeIntervalSince1970];
     RSProbeStopWall = 0;
     RSProbeLastFlush = CACurrentMediaTime();
@@ -2466,6 +2503,7 @@ static void RSProbeTick(UIView *element) {
     if (now - RSProbeLastTick < 1.0) return;
     RSProbeLastTick = now;
     RSProbeSamples++;
+    RSProbeStatTicks++;
     @try {
         RSProbeCloseStale();
         RSProbeAuditPrefs(RSSharinganView);
