@@ -1676,7 +1676,7 @@ static BOOL RSV622LooksLikeDot(UIView *v) {
     if (!v) return NO;
     if ([v isKindOfClass:[UIWindow class]]) return NO;
     if (!RSV622ClassHas(v, @"RecordingIndicator")) return NO;
-    if (!v.window) return NO;
+    if (!v.superview) return NO;
     if (v.hidden) return NO;
     CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
     if (w < 2.0 || h < 2.0 || w > 30.0 || h > 30.0) return NO;
@@ -1722,6 +1722,49 @@ static NSArray<UIView *> *RSV622CollectDots(void) {
     return dots;
 }
 
+// Portal 里的红点：屏幕上真正显示的是 Portal 本身的位置，sourceView 可能停在 (0,0) 之类的位置。
+static UIView *RSV622AnchorForDot(UIView *dot) {
+    if (!dot) return nil;
+    NSInteger hops = 0;
+    for (UIView *p = dot.superview; p && hops++ < 4; p = p.superview) {
+        if (RSV622ClassHas(p, @"Portal")) {
+            CGRect r = RSV622ScreenRect(p);
+            if (!CGRectIsEmpty(r) && CGRectGetWidth(r) <= 44.0 && CGRectGetHeight(r) <= 44.0) return p;
+        }
+    }
+    return dot;
+}
+
+// 兜底：类名被改掉时，用“小尺寸 + 红色背景”在药丸子树里直接找红点。
+static UIView *RSV622EnclosingPill(UIView *v) {
+    NSInteger hops = 0;
+    for (UIView *p = v; p && hops++ < 12; p = p.superview) {
+        if (RSViewClassContains(p, @"SBSystemApertureContainerView")) return p;
+    }
+    return nil;
+}
+
+static NSArray<UIView *> *RSV622RedLeafDots(UIView *root) {
+    NSMutableArray<UIView *> *out = [NSMutableArray array];
+    if (!root) return out;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger guard = 0;
+    while (stack.count && guard++ < 500) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        UIView *eye = RSSharinganView;
+        if (v == eye || (eye && [v isDescendantOfView:eye])) continue;
+        if (v != root && v.window && !v.hidden && v.alpha > 0.01) {
+            CGFloat w = CGRectGetWidth(v.bounds), h = CGRectGetHeight(v.bounds);
+            if (w >= 2.0 && h >= 2.0 && w <= 24.0 && h <= 24.0 && RSRedScoreInView(v, 0) >= 25) {
+                [out addObject:v];
+            }
+        }
+        for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+    }
+    return out;
+}
+
 static BOOL RSV622RectHoldsPoint(CGRect r, CGPoint p, CGFloat slop) {
     if (CGRectIsEmpty(r)) return NO;
     return p.x >= CGRectGetMinX(r) - slop && p.x <= CGRectGetMaxX(r) + slop &&
@@ -1733,14 +1776,17 @@ static BOOL RSV622ScreenRight(CGFloat x) {
 }
 
 static UIView *RSV622BestDotForElement(UIView *element);
+static UIView *RSV622AnchorForDot(UIView *dot);
 
 // 逐帧复用缓存的红点，只有在缓存失效或离屏时才重新扫描。
 static UIView *RSV622FastDot(UIView *element) {
     NSTimeInterval now = CACurrentMediaTime();
     UIView *dot = RSV622CachedDot;
-    if (dot && dot.window && !dot.hidden && (now - RSV622CachedDotAt) < 0.30) {
-        CGRect r = RSV622ScreenRect(dot);
+    if (dot && dot.superview && !dot.hidden && (now - RSV622CachedDotAt) < 0.30) {
+        CGRect r = RSV622ScreenRect(RSV622AnchorForDot(dot));
         if (!CGRectIsEmpty(r) && CGRectIntersectsRect(r, [UIScreen mainScreen].bounds)) return dot;
+    } else if (!dot && RSV622CachedDotAt > 0 && (now - RSV622CachedDotAt) < 0.30) {
+        return nil;   // 负结果也缓存 0.30s，避免逐帧全树扫描
     }
     dot = RSV622BestDotForElement(element);
     RSV622CachedDot = dot;
@@ -1751,6 +1797,19 @@ static UIView *RSV622FastDot(UIView *element) {
 // 选锚点红点：可见优先 → 落在录屏元素矩形内优先 → 最靠左优先（用户期望“岛的最左边”）。
 static UIView *RSV622BestDotForElement(UIView *element) {
     NSArray<UIView *> *dots = RSV622CollectDots();
+    if (!dots.count) {
+        // 类名兜底：录屏元素所在药丸里的小红块
+        UIView *pill = RSV622EnclosingPill(element);
+        if (pill) dots = RSV622RedLeafDots(pill);
+        if (dots.count) {
+            NSTimeInterval now2 = CACurrentMediaTime();
+            if (now2 - RSV622LastCandidateLog > 3.0) {
+                RSV622LastCandidateLog = now2;
+                RSLog(@"[V6.22] dot class scan empty; red-leaf fallback pill=%@ found=%lu",
+                      NSStringFromClass(pill.class), (unsigned long)dots.count);
+            }
+        }
+    }
     NSUInteger count = dots.count;
     if (!count) return nil;
     CGRect screenBounds = [UIScreen mainScreen].bounds;
@@ -1761,7 +1820,8 @@ static UIView *RSV622BestDotForElement(UIView *element) {
     BOOL logCandidates = (now - RSV622LastCandidateLog) > 3.0;
     if (logCandidates) RSV622LastCandidateLog = now;
     for (UIView *dot in dots) {
-        CGRect dr = RSV622ScreenRect(dot);
+        UIView *anchor = RSV622AnchorForDot(dot);
+        CGRect dr = RSV622ScreenRect(anchor);
         if (CGRectIsEmpty(dr)) continue;
         if (!CGRectIntersectsRect(dr, screenBounds)) continue;
         CGFloat score = 0.0;
@@ -1771,9 +1831,9 @@ static UIView *RSV622BestDotForElement(UIView *element) {
         // 同分时最靠左的优先
         score -= (CGRectGetMidX(dr) / MAX(1.0, CGRectGetWidth(screenBounds))) * 20.0;
         if (logCandidates) {
-            RSLog(@"[V6.22] dot candidate %@ screen=%@ alpha=%.2f window=%@ super=%@ score=%.1f",
-                  NSStringFromClass(dot.class), NSStringFromCGRect(dr), dot.alpha,
-                  NSStringFromClass(dot.window.class), NSStringFromClass(dot.superview.class), score);
+            RSLog(@"[V6.22] dot candidate %@ screen=%@ anchor=%@ alpha=%.2f window=%@ super=%@ score=%.1f",
+                  NSStringFromClass(dot.class), NSStringFromCGRect(dr), NSStringFromClass(anchor.class),
+                  dot.alpha, NSStringFromClass(anchor.window.class), NSStringFromClass(dot.superview.class), score);
         }
         if (!best || score > bestScore) { best = dot; bestScore = score; }
     }
@@ -1847,7 +1907,7 @@ static void RSV622TrackDot(UIView *dot) {
 // 素材不可见（grace / 恢复等待）时把压过的红点全部还原。
 static void RSV622SyncDotVisibility(UIView *anchor, UIView *host, BOOL eyeVisible) {
     NSArray<UIView *> *dots = RSV622CollectDots();
-    CGRect anchorScreen = RSV622ScreenRect(anchor);
+    CGRect anchorScreen = RSV622ScreenRect(RSV622AnchorForDot(anchor));
     CGRect hostScreen = RSV622ScreenRect(host);
     CGRect zone = CGRectUnion(anchorScreen, hostScreen);
     if (!CGRectIsEmpty(zone)) zone = CGRectInset(zone, -6.0, -6.0);
@@ -1855,7 +1915,7 @@ static void RSV622SyncDotVisibility(UIView *anchor, UIView *host, BOOL eyeVisibl
         NSNumber *old = objc_getAssociatedObject(dot, RSOriginalAlphaKey);
         BOOL inside = NO;
         if (!CGRectIsEmpty(zone)) {
-            CGRect dr = RSV622ScreenRect(dot);
+            CGRect dr = RSV622ScreenRect(RSV622AnchorForDot(dot));
             inside = !CGRectIsEmpty(dr) && CGRectIntersectsRect(dr, zone);
         }
         if (eyeVisible && inside) {
@@ -1902,7 +1962,8 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
         return NO;
     }
 
-    CGRect dotScreen = RSV622ScreenRect(dot);
+    UIView *dotAnchor = RSV622AnchorForDot(dot);
+    CGRect dotScreen = RSV622ScreenRect(dotAnchor);
     if (CGRectIsEmpty(dotScreen)) { RSV622AnchoredActive = NO; return NO; }
     RSV622AnchoredActive = YES;
     CGPoint dotCenterScreen = CGPointMake(CGRectGetMidX(dotScreen), CGRectGetMidY(dotScreen));
@@ -1929,11 +1990,7 @@ static BOOL RSV622DotAnchoredPlacement(UIView *element, BOOL allowShow) {
     RSApplyMaterialForSide(eye, right);
     CGFloat configured = right ? RSRightSize() : RSLeftSize();
 
-    CGPoint dotCenterInWindow = dotCenterScreen;
-    @try {
-        dotCenterInWindow = [dot convertPoint:CGPointMake(CGRectGetMidX(dot.bounds), CGRectGetMidY(dot.bounds)) toView:dot.window];
-    } @catch (...) { dotCenterInWindow = dotCenterScreen; }
-    CGPoint center = RSV622WindowPointToView(dotCenterInWindow, host, dot.window);
+    CGPoint center = RSV622WindowPointToView(dotCenterScreen, host, dotAnchor.window);
     center.x += right ? RSRightXOffset() : RSLeftXOffset();
     center.y += RSYOffset();
 
