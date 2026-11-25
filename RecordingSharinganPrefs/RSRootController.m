@@ -269,7 +269,7 @@ static void RSMaterialAlert(UIViewController *vc,NSString *message) {
 }
 - (void)resetDefaults {
  NSString *domain=@"com.tu.recordingsharingan.settings";
- NSDictionary *defaults=@{@"rotationSpeed":@1.0,@"leftXOffset":@0.0,@"rightXOffset":@0.0,@"yOffset":@0.0,@"leftSize":@31.0,@"rightSize":@37.0,@"islandLeftExtra":@7.0};
+ NSDictionary *defaults=@{@"rotationSpeed":@1.0,@"leftXOffset":@0.0,@"rightXOffset":@0.0,@"yOffset":@0.0,@"leftSize":@31.0,@"rightSize":@37.0};
  for(NSString *key in defaults)CFPreferencesSetAppValue((__bridge CFStringRef)key,(__bridge CFPropertyListRef)defaults[key],(__bridge CFStringRef)domain);
  CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
  CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),CFSTR("com.tu.recordingsharingan.settings.changed"),NULL,NULL,YES);
