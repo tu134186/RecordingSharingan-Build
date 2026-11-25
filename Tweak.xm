@@ -2098,10 +2098,11 @@ static const void *RSProbeDotScreenRectKey = &RSProbeDotScreenRectKey;
 // —— 这就是之前颜色扫描一直漏掉系统红点的原因：它被 portal 渲染，window 是空的。
 static CGRect RSProbeDotScreenRect(UIView *dot) {
     if (!dot) return CGRectZero;
-    CGRect r = RSV622ScreenRect(dot);
-    if (!CGRectIsEmpty(r)) return r;
-    NSValue *v = objc_getAssociatedObject(dot, RSProbeDotScreenRectKey);
-    return v ? v.CGRectValue : CGRectZero;
+    // Portal 里面的视图：屏幕上真正显示的位置是 Portal 的位置，
+    // 它自己的 convertRect 往往返回离屏坐标（甚至 (0,0)），必须优先用关联值。
+    NSValue *pv = objc_getAssociatedObject(dot, RSProbeDotScreenRectKey);
+    if (pv) return pv.CGRectValue;
+    return RSV622ScreenRect(dot);
 }
 
 static NSArray<UIView *> *RSProbeScanRedDots(void) {
@@ -2142,7 +2143,16 @@ static NSArray<UIView *> *RSProbeScanRedDots(void) {
                     [stack addObject:src];
                 }
             }
-            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+            // 把「我这一支在屏幕上的位置」传给子视图（portal 子树全靠这个）
+            NSValue *inherit = objc_getAssociatedObject(v, RSProbeDotScreenRectKey);
+            for (UIView *sub in [v.subviews copy]) {
+                if (!sub) continue;
+                if (inherit && CGRectIsEmpty(RSV622ScreenRect(sub))) {
+                    objc_setAssociatedObject(sub, RSProbeDotScreenRectKey, inherit,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                [stack addObject:sub];
+            }
         }
     }
     // 只保留最内层：祖先也命中时丢掉祖先，避免把整个容器当红点
@@ -2551,7 +2561,8 @@ static void RSProbeJudge(UIView *element) {
     }
 
     UIView *dot = RSV622BestDotForElement(el);
-    if (!dot || !dot.window) {
+    if (!dot || !dot.window) dot = RSProbeBestRedDot(el);
+    if (!dot || CGRectIsEmpty(RSProbeDotScreenRect(dot))) {
         RSProbeStatNoDot++;
         if (RSProbeStatNoDot > 3 && (RSProbeStatNoDot % 5) == 1) {
             NSString *detail = [NSString stringWithFormat:
@@ -2563,7 +2574,8 @@ static void RSProbeJudge(UIView *element) {
         return;
     }
     UIView *anchor = RSV622AnchorForDot(dot);
-    CGRect dotRect = RSV622ScreenRect(anchor);
+    CGRect dotRect = RSProbeDotScreenRect(dot);
+    if (CGRectIsEmpty(dotRect)) dotRect = RSV622ScreenRect(anchor);
     if (CGRectIsEmpty(dotRect) || !CGRectIntersectsRect(dotRect, [UIScreen mainScreen].bounds)) {
         RSProbeStatDotOff++;
         return;
