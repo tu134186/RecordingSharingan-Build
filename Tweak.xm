@@ -3038,14 +3038,110 @@ static void RSV633TeardownOverlay(void) {
     } @catch (...) {}
 }
 
-// ---- 6.34 查找缓存 ----------------------------------------------------------
-// CADisplayLink 每帧都会调到这里。RSV633PillForElement / RSV633AccessoryPortalForElement
-// 原本各自要遍历上千个视图，morph 时找不到还要再全树扫一遍 —— 每帧这样扫会掉帧，
-// 表现就是"素材跟不上岛"。这里给两者加弱引用缓存 + 限频全树扫描。
+// ============================================================================
+// V7.11.9.4.3.2.6.36 —— 药丸与 Portal 必须来自同一个元素
+//
+// 6.35 实测日志：60 次采样里有 14 次（23%）锚点落在它自己测量的岛矩形之外，例如
+//   01:33:54  island=(112.3,10.7) 167.3 宽  → 覆盖 112~279
+//             anchor=306.7                    → 在右边那个独立圆岛上
+// 原因：RSV633PillForElement 按「与元素矩形相交的最高药丸」挑，选中左边宽岛；
+//       RSV633AccessoryPortalForElement 按「离元素中心最近」挑，选中右边圆岛的 portal。
+// 两者来自不同元素 → 锚点必然跑出测量矩形，素材被拽到另一端或被判成 out of island。
+//
+// 6.36：先找 Portal，再从 Portal 的祖先链找它所属的药丸。
+// 这样 island 与 anchor 永远是同一个元素的几何，不可能再错位。
+// ============================================================================
+
+static BOOL RSV633Live(UIView *v, CGFloat minSide, CGFloat maxSide);
+static BOOL RSV635IslandPlausible(CGRect r);
+
+// 真正的药丸类。注意 _SBSystemApertureContainerViewContentView 名字里也含这个子串，
+// 它只是内容层，不是药丸本体，必须排除。
+static BOOL RSV636IsPillClass(UIView *v) {
+    if (!v) return NO;
+    NSString *n = NSStringFromClass(v.class);
+    if (!n.length) return NO;
+    if ([n rangeOfString:@"SBSystemApertureContainerView"].location == NSNotFound) return NO;
+    if ([n rangeOfString:@"ContentView"].location != NSNotFound) return NO;
+    return YES;
+}
+
+// 从任意视图向上找它所属的 SBSystemApertureContainerView（药丸）。
+static UIView *RSV636PillForView(UIView *v) {
+    NSInteger hops = 0;
+    for (UIView *p = v; p && hops++ < 16; p = p.superview) {
+        if (RSV636IsPillClass(p)) {
+            CGRect r = RSV634PresentationScreenRect(p);
+            if (!CGRectIsEmpty(r) && CGRectGetHeight(r) >= 14.0) return p;
+        }
+    }
+    return nil;
+}
+
+// 同时给出「这个录屏元素自己的 Portal」和「它所属的药丸」。
+// 返回 YES 时 portal 与 pill 保证同属一个元素；pill 可能为 nil（只拿到 portal）。
+static BOOL RSV636PortalAndPill(UIView *element, UIView **outPortal, UIView **outPill) {
+    if (outPortal) *outPortal = nil;
+    if (outPill) *outPill = nil;
+    if (!element) return NO;
+
+    // ① 正常路径：系统自己的 accessory 查找（它会优先返回 portal 叶子）。
+    UIView *best = RSV711BestAccessoryHostForElement(element);
+    if (best && RSV711IsAccessoryPortal(best) && RSV633Live(best, 6.0, 90.0)) {
+        UIView *pill = RSV636PillForView(best);
+        if (!pill || RSV635IslandPlausible(RSV634PresentationScreenRect(pill))) {
+            if (outPortal) *outPortal = best;
+            if (outPill) *outPill = pill;
+            return YES;
+        }
+    }
+
+    // ② 兜底：全窗口扫所有 AccessoryPortal，挑「与元素矩形相交、且药丸可信」里最近的。
+    CGRect er = RSV634PresentationScreenRect(element);
+    UIView *bestPortal = nil;
+    UIView *bestPill = nil;
+    CGFloat bestScore = CGFLOAT_MAX;
+    for (UIWindow *w in RSAllApplicationWindows()) {
+        if (!w || w == RSV633OverlayWindow) continue;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        NSInteger guard = 0;
+        while (stack.count && guard++ < 1800) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (!v) continue;
+            if (v.window && RSV622ClassHas(v, @"AccessoryPortal")) {
+                CGRect pr = RSV634PresentationScreenRect(v);
+                if (!CGRectIsEmpty(pr) && CGRectGetWidth(pr) >= 6.0 && CGRectGetHeight(pr) >= 6.0) {
+                    UIView *pill = RSV636PillForView(v);
+                    CGRect pillRect = pill ? RSV634PresentationScreenRect(pill) : CGRectZero;
+                    if (pill && !RSV635IslandPlausible(pillRect)) pill = nil;
+                    // 锚点必须在自己的药丸里，否则这条候选自相矛盾，直接丢掉。
+                    CGRect container = pill ? pillRect : pr;
+                    CGPoint pc = CGPointMake(CGRectGetMidX(pr), CGRectGetMidY(pr));
+                    BOOL inside = pc.x >= CGRectGetMinX(container) - 2.0 && pc.x <= CGRectGetMaxX(container) + 2.0;
+                    if (!inside) continue;
+                    CGFloat score = 0.0;
+                    if (!CGRectIsEmpty(er) && CGRectIntersectsRect(er, pr)) score -= 500.0;
+                    score += fabs(pc.x - CGRectGetMidX(er)) + fabs(pc.y - CGRectGetMidY(er)) * 0.5;
+                    if (score < bestScore) { bestScore = score; bestPortal = v; bestPill = pill; }
+                }
+            }
+            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+        }
+    }
+    if (bestPortal) {
+        if (outPortal) *outPortal = bestPortal;
+        if (outPill) *outPill = bestPill;
+        return YES;
+    }
+    return NO;
+}
+// ---- 6.36 缓存：一对 Portal + 它所属的药丸 ---------------------------------
+// CADisplayLink 每帧都会调到这里。以前 pill / portal 各自独立扫描，既慢又不一致；
+// 现在一次解析出「同一元素」的 portal+pill，成对缓存，校验也成对校验。
 static __weak UIView *RSV633CachedPill = nil;
 static __weak UIView *RSV633CachedPortal = nil;
-static NSTimeInterval RSV633PillScanAt = 0;
-static NSTimeInterval RSV633PortalScanAt = 0;
+static NSTimeInterval RSV633PairAt = 0;
 
 static BOOL RSV633Live(UIView *v, CGFloat minSide, CGFloat maxSide) {
     if (!v || !v.window || v.hidden || v.alpha <= 0.01) return NO;
@@ -3055,93 +3151,61 @@ static BOOL RSV633Live(UIView *v, CGFloat minSide, CGFloat maxSide) {
     return (w >= minSide && h >= minSide && w <= maxSide && h <= maxSide);
 }
 
-// 录屏元素所在的药丸（SBSystemApertureContainerView）。缓存优先，全树扫描 0.30s 限一次。
-static UIView *RSV633PillForElement(UIView *element) {
-    if (!element) return nil;
-    if (RSV633Live(RSV633CachedPill, 8.0, 520.0)) return RSV633CachedPill;
-
-    // 向上找祖先：几乎总是命中，且非常便宜。
-    NSInteger hops = 0;
-    for (UIView *p = element.superview; p && hops++ < 12; p = p.superview) {
-        if (RSV622ClassHas(p, @"SBSystemApertureContainerView") && RSV633Live(p, 8.0, 520.0)) {
-            RSV633CachedPill = p;
-            return p;
-        }
-    }
-
-    NSTimeInterval now = CACurrentMediaTime();
-    if (now - RSV633PillScanAt < 0.30 && RSV633CachedPill) return RSV633CachedPill;
-    RSV633PillScanAt = now;
-
-    CGRect er = RSV634PresentationScreenRect(element);
-    if (CGRectIsEmpty(er)) return RSV633CachedPill;
-    CGRect probe = CGRectInset(er, -60.0, -60.0);
-    UIView *best = nil;
-    CGFloat bestH = 0.0;
-    for (UIWindow *w in RSAllApplicationWindows()) {
-        if (!w || w == RSV633OverlayWindow) continue;
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
-        NSInteger guard = 0;
-        while (stack.count && guard++ < 1500) {
-            UIView *v = stack.lastObject;
-            [stack removeLastObject];
-            if (!v) continue;
-            if (v.window && RSV622ClassHas(v, @"SBSystemApertureContainerView")) {
-                CGRect r = RSV634PresentationScreenRect(v);
-                if (!CGRectIsEmpty(r) && CGRectIntersectsRect(r, probe) &&
-                    CGRectGetHeight(r) >= 16.0 && CGRectGetHeight(r) > bestH) {
-                    bestH = CGRectGetHeight(r);
-                    best = v;
-                }
-            }
-            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
-        }
-    }
-    if (best) RSV633CachedPill = best;
-    return best ?: RSV633CachedPill;
+// 缓存的这对是否还能用：portal 活着、pill 活着，且 portal 中心确实落在 pill 里。
+static BOOL RSV633PairValid(void) {
+    if (!RSV633Live(RSV633CachedPortal, 6.0, 90.0)) return NO;
+    if (!RSV633CachedPill) return YES;   // 只有 portal：也能用，药丸由调用方退回祖先链
+    if (!RSV633Live(RSV633CachedPill, 8.0, 520.0)) return NO;
+    CGRect pr = RSV634PresentationScreenRect(RSV633CachedPortal);
+    CGRect br = RSV634PresentationScreenRect(RSV633CachedPill);
+    CGFloat cx = CGRectGetMidX(pr);
+    return (cx >= CGRectGetMinX(br) - 2.0 && cx <= CGRectGetMaxX(br) + 2.0);
 }
 
-// 录屏元素真正「画出来」的那片 Portal 叶子（红点就在它里面被镜像显示）。
-static UIView *RSV633AccessoryPortalForElement(UIView *element) {
-    if (!element) return nil;
-    if (RSV633Live(RSV633CachedPortal, 6.0, 80.0)) return RSV633CachedPortal;
-
+static void RSV633ResolvePair(UIView *element, UIView **outPortal, UIView **outPill) {
+    UIView *portal = nil, *pill = nil;
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - RSV633PortalScanAt < 0.20 && RSV633CachedPortal) return RSV633CachedPortal;
-    RSV633PortalScanAt = now;
-
-    UIView *best = RSV711BestAccessoryHostForElement(element);
-    if (best && RSV711IsAccessoryPortal(best) && RSV633Live(best, 6.0, 80.0)) {
-        RSV633CachedPortal = best;
-        return best;
+    if (RSV633PairValid() && (now - RSV633PairAt) < 0.12) {
+        if (outPortal) *outPortal = RSV633CachedPortal;
+        if (outPill) *outPill = RSV633CachedPill;
+        return;
     }
-    // RSV711BestAccessoryHostForElement 正常情况下就会优先返回 portal；
-    // 它没返回 portal 说明这一刻确实没有（morph 重建中），直接返回 nil 让上层沿用上次锚点。
-    return RSV633CachedPortal;
+    if (RSV636PortalAndPill(element, &portal, &pill)) {
+        if (portal) RSV633CachedPortal = portal;
+        if (pill) RSV633CachedPill = pill;
+        RSV633PairAt = now;
+    } else {
+        // 这一刻系统正在重建：把上一对原样交出去，让上层沿用锚点，不要自己去猜。
+        portal = RSV633CachedPortal;
+        pill = RSV633CachedPill;
+    }
+    if (outPortal) *outPortal = portal;
+    if (outPill) *outPill = pill;
+}
+
+// 药丸优先取「与 portal 同源」的那个；没有 portal 时才退回元素祖先。
+static UIView *RSV633PillForElement(UIView *element) {
+    UIView *portal = nil, *pill = nil;
+    RSV633ResolvePair(element, &portal, &pill);
+    if (pill) return pill;
+    NSInteger hops = 0;
+    for (UIView *p = element.superview; p && hops++ < 12; p = p.superview) {
+        if (RSV636IsPillClass(p) && RSV633Live(p, 8.0, 520.0)) return p;
+    }
+    return nil;
+}
+
+static UIView *RSV633AccessoryPortalForElement(UIView *element) {
+    UIView *portal = nil, *pill = nil;
+    RSV633ResolvePair(element, &portal, &pill);
+    return portal;
 }
 
 static void RSV633ResetLookupCache(void) {
     RSV633CachedPill = nil;
     RSV633CachedPortal = nil;
-    RSV633PillScanAt = 0;
-    RSV633PortalScanAt = 0;
+    RSV633PairAt = 0;
 }
-
-// ============================================================================
-// V7.11.9.4.3.2.6.34 —— 跟随系统形变（presentation 同步 + 锚点记忆 + 侧别迟滞）
-//
-// 6.33 能挂上了，但 morph 时素材「快了 / 慢了 / 乱跳」，三个原因都在日志和逐帧里：
-//   1) RSV622ScreenRect 读的是 layer 的 model frame。系统 morph 时 model 已经是终值，
-//      屏幕上还在 presentation 动画里爬 —— 素材提前到终点，收尾又不动，看着就是「快了/慢了」。
-//   2) morph 中 accessory Portal 会瞬间为空，代码退化成「岛中心推算」，而内缩量用
-//      island.h/2：展开态 h=62.7 → 内缩 31.3 → 算出 175.7，真实红点在 143.8，
-//      素材直接窜到岛中间（日志 00:37:08 / 00:39:34 / 00:39:41）。
-//   3) 侧别在 morph 中一秒翻好几次（00:39:42 right → :43 left → :45 right），
-//      尺寸 31↔37 硬跳，X 偏移跟着换边。
-//
-// 6.34：几何全部改读 presentationLayer（与系统动画同一帧的值），portal 缺失时
-// 沿用上一次锚点而不是去猜，侧别与尺寸加迟滞，morph 期间不隐藏素材。
-// ============================================================================
 
 // 屏幕上**正在显示**的矩形：读 presentationLayer，和系统动画同帧。
 static CGRect RSV634PresentationScreenRect(UIView *v) {
@@ -3149,6 +3213,7 @@ static CGRect RSV634PresentationScreenRect(UIView *v) {
     @try {
         CALayer *pl = (CALayer *)v.layer.presentationLayer;
         CALayer *wl = (CALayer *)v.window.layer.presentationLayer;
+        if (!wl) wl = v.window.layer;   // 窗口层没有动画时 presentationLayer 为 nil
         if (pl && wl) {
             CGRect b = pl.bounds;
             CGPoint p1 = [pl convertPoint:CGPointMake(CGRectGetMinX(b), CGRectGetMinY(b)) toLayer:wl];
