@@ -415,6 +415,7 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow);
 static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow);
 static void RSV634ResetFollowState(void);
 static void RSV633ResetLookupCache(void);
+static void RSV637ResetFollow(void);
 static CGRect RSV634PresentationScreenRect(UIView *v);
 
 static void RSStartRotation(UIView *view) {
@@ -3030,6 +3031,7 @@ static void RSV633TeardownOverlay(void) {
     RSV633LastAnchorAt = 0;
     RSV634ResetFollowState();
     RSV633ResetLookupCache();
+    RSV637ResetFollow();
     if (!w) return;
     @try {
         w.hidden = YES;
@@ -3078,6 +3080,105 @@ static UIView *RSV636PillForView(UIView *v) {
     return nil;
 }
 
+// ============================================================================
+// V7.11.9.4.3.2.6.37 —— 让素材「滑」过去，而不是瞬移
+//
+// 6.36 实测（video 476ED237 逐帧 + 日志）：
+//   40 秒里素材在 140 和 278 之间来回瞬移 20 次（每次一帧 137pt），另有 6 帧整块消失。
+//   日志 43 条 anchor 全在 island 内（6.36 的同源修复有效），但：
+//     · 02:08:15  island 是宽岛(127.8,169.2)  anchor=144.3
+//       02:08:16  island 是圆岛(251.5,37.2)   anchor=270.1
+//       → portal 在不同元素的岛之间被反复挑中，锚点跟着换岛 = 瞬移
+//     · 消失的 6 帧：capture-off grace（RSPauseEyeForCaptureGrace）在 morph 期间把 eye.hidden=YES
+//
+// 6.37 三件事：
+//   1) Portal 必须在「录屏元素自己的子树」里找 —— 不再靠全窗口距离打分，
+//      从根上排除「挑到音乐那个岛的 portal」。
+//   2) 真的需要换位置（一次 >8pt）时，用时间常数 35ms 的指数跟随滑过去，
+//      小于 8pt 的逐帧微动仍然直接贴（保持和系统动画完全同帧，不产生滞后）。
+//   3) morph 期间不再隐藏素材：只有「portal 没了 且 岛也没了」持续 0.45s 才隐藏。
+// ============================================================================
+
+// 录屏元素自己的 Portal：只在这个元素的子树里找，保证不会挑到别的岛。
+static UIView *RSV637PortalInElement(UIView *element) {
+    if (!element) return nil;
+    UIView *best = nil;
+    CGFloat bestArea = 0.0;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:element];
+    NSInteger guard = 0;
+    while (stack.count && guard++ < 900) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if (!v || v == RSSharinganView) continue;
+        if (RSV622ClassHas(v, @"AccessoryPortal")) {
+            CGRect r = RSV634PresentationScreenRect(v);
+            if (!CGRectIsEmpty(r) && CGRectGetWidth(r) >= 6.0 && CGRectGetHeight(r) >= 6.0) {
+                CGFloat area = CGRectGetWidth(r) * CGRectGetHeight(r);
+                if (area > bestArea) { bestArea = area; best = v; }
+            }
+        }
+        for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+        // Portal 的 sourceView 不在 subviews 里，但矩形计算不受影响，无需进入。
+    }
+    return best;
+}
+
+// 6.37 平滑跟随：把「瞬移」变成「滑动」。
+static CGPoint RSV637FollowPoint = CGPointZero;
+static NSTimeInterval RSV637FollowAt = 0;
+static BOOL RSV637FollowHas = NO;
+
+static void RSV637ResetFollow(void) {
+    RSV637FollowHas = NO;
+    RSV637FollowAt = 0;
+    RSV637FollowPoint = CGPointZero;
+}
+
+// 目标点 → 实际使用的点。逐帧微动直接贴；只有大跳变才插值。
+static CGPoint RSV637Smooth(CGPoint want) {
+    NSTimeInterval now = CACurrentMediaTime();
+    CGFloat dt = (RSV637FollowAt > 0) ? (now - RSV637FollowAt) : 0.016;
+    if (dt <= 0.0 || dt > 0.25) dt = 0.016;
+    RSV637FollowAt = now;
+    if (!RSV637FollowHas) {
+        RSV637FollowHas = YES;
+        RSV637FollowPoint = want;
+        return want;
+    }
+    CGFloat dx = want.x - RSV637FollowPoint.x;
+    CGFloat dy = want.y - RSV637FollowPoint.y;
+    CGFloat dist = hypot(dx, dy);
+    if (dist < 8.0) {
+        // 正常 morph：完全跟随，零滞后。
+        RSV637FollowPoint = want;
+        return want;
+    }
+    // 换岛/换元素的瞬移：35ms 时间常数滑过去（约 120ms 到 95%）。
+    CGFloat k = 1.0 - exp(-dt / 0.035);
+    if (k > 0.92) k = 0.92;
+    RSV637FollowPoint = CGPointMake(RSV637FollowPoint.x + dx * k, RSV637FollowPoint.y + dy * k);
+    return RSV637FollowPoint;
+}
+
+// 岛在整个屏幕上是否还存在（不要求与录屏元素同源）—— 用来区分「morph」与「真的结束」。
+static BOOL RSV637AnyIslandOnScreen(void) {
+    for (UIWindow *w in RSAllApplicationWindows()) {
+        if (!w || w == RSV633OverlayWindow) continue;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        NSInteger guard = 0;
+        while (stack.count && guard++ < 1200) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (!v) continue;
+            if (v.window && RSV636IsPillClass(v)) {
+                CGRect r = RSV634PresentationScreenRect(v);
+                if (RSV635IslandPlausible(r)) return YES;
+            }
+            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+        }
+    }
+    return NO;
+}
 // 同时给出「这个录屏元素自己的 Portal」和「它所属的药丸」。
 // 返回 YES 时 portal 与 pill 保证同属一个元素；pill 可能为 nil（只拿到 portal）。
 static BOOL RSV636PortalAndPill(UIView *element, UIView **outPortal, UIView **outPill) {
@@ -3085,18 +3186,45 @@ static BOOL RSV636PortalAndPill(UIView *element, UIView **outPortal, UIView **ou
     if (outPill) *outPill = nil;
     if (!element) return NO;
 
-    // ① 正常路径：系统自己的 accessory 查找（它会优先返回 portal 叶子）。
+    // ① 首选：录屏元素**自己的子树**里的 Portal —— 不可能挑到别的岛。
+    UIView *own = RSV637PortalInElement(element);
+    if (own && RSV633Live(own, 6.0, 90.0)) {
+        UIView *pill = RSV636PillForView(own);
+        if (!pill || RSV635IslandPlausible(RSV634PresentationScreenRect(pill))) {
+            if (outPortal) *outPortal = own;
+            if (outPill) *outPill = pill;
+            static NSTimeInterval lastOwnLog = 0;
+            NSTimeInterval now0 = CACurrentMediaTime();
+            if (now0 - lastOwnLog > 2.0) {
+                lastOwnLog = now0;
+                RSLog(@"[V6.37] own portal class=%@ rect=%@ pill=%@ pillRect=%@",
+                      NSStringFromClass(own.class), NSStringFromCGRect(RSV634PresentationScreenRect(own)),
+                      pill ? NSStringFromClass(pill.class) : @"nil",
+                      NSStringFromCGRect(pill ? RSV634PresentationScreenRect(pill) : CGRectZero));
+            }
+            return YES;
+        }
+    }
+
+    // ② 兜底：系统 accessory 查找（可能挑到别的元素，因此仅在①失败时使用）。
     UIView *best = RSV711BestAccessoryHostForElement(element);
     if (best && RSV711IsAccessoryPortal(best) && RSV633Live(best, 6.0, 90.0)) {
         UIView *pill = RSV636PillForView(best);
         if (!pill || RSV635IslandPlausible(RSV634PresentationScreenRect(pill))) {
             if (outPortal) *outPortal = best;
             if (outPill) *outPill = pill;
+            static NSTimeInterval lastLooseLog = 0;
+            NSTimeInterval now1 = CACurrentMediaTime();
+            if (now1 - lastLooseLog > 2.0) {
+                lastLooseLog = now1;
+                RSLog(@"[V6.37] LOOSE portal class=%@ rect=%@ (not inside element)", NSStringFromClass(best.class),
+                      NSStringFromCGRect(RSV634PresentationScreenRect(best)));
+            }
             return YES;
         }
     }
 
-    // ② 兜底：全窗口扫所有 AccessoryPortal，挑「与元素矩形相交、且药丸可信」里最近的。
+    // ③ 最后兜底：全窗口扫所有 AccessoryPortal，挑「与元素矩形相交、且药丸可信」里最近的。
     CGRect er = RSV634PresentationScreenRect(element);
     UIView *bestPortal = nil;
     UIView *bestPill = nil;
@@ -3396,8 +3524,23 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
             anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
             fromPortal = YES;
         } else {
-            eye.hidden = YES;
-            return YES; // 已接管（不落回旧路径），只是暂时没有可用锚点
+            // 6.37：morph 期间锚点会短暂空掉。只有「连岛都没有了」才隐藏，
+            // 否则停在最后位置继续显示，避免素材闪一下不见。
+            static NSTimeInterval lastIslandGoneAt = 0;
+            BOOL islandAlive = RSV637AnyIslandOnScreen();
+            if (!islandAlive) {
+                if (lastIslandGoneAt <= 0) lastIslandGoneAt = now;
+                if (now - lastIslandGoneAt > 0.45) { eye.hidden = YES; return YES; }
+            } else {
+                lastIslandGoneAt = 0;
+            }
+            if (!CGRectIsEmpty(RSV633LastAnchor)) {
+                anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
+                fromPortal = YES;
+            } else {
+                eye.hidden = YES;
+                return YES;
+            }
         }
     }
 
@@ -3419,6 +3562,8 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     CGPoint center = RSV622WindowPointToView(anchor, overlay, anchorWindow ?: element.window);
     center.x += right ? RSRightXOffset() : RSLeftXOffset();
     center.y += RSYOffset();
+    // 6.37：换岛时滑过去，不要瞬移。
+    center = RSV637Smooth(center);
 
     if (eye.superview != overlay) {
         [eye removeFromSuperview];
@@ -3438,8 +3583,19 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
         }];
     }
 
-    BOOL visible = allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending;
-    if (visible) { eye.hidden = NO; eye.alpha = 1.0; }
+    // 6.37：覆盖层是独立窗口，morph 期间的 capture-off grace 不该让它隐藏 ——
+    // 那正是「变形时素材闪一下」的来源。
+    BOOL visible = allowShow && !RSEyeResumeVisibilityPending;
+    if (visible) {
+        eye.hidden = NO;
+        eye.alpha = 1.0;
+        if (RSEyeGracePaused) {
+            // grace 把 layer 冻结了（speed=0）；覆盖层要持续跟随即恢复。
+            eye.layer.speed = 1.0;
+            eye.layer.timeOffset = 0.0;
+            eye.layer.beginTime = 0.0;
+        }
+    }
 
     static NSTimeInterval lastDotSync = 0;
     NSTimeInterval nowDot = CACurrentMediaTime();
