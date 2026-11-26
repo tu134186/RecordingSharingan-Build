@@ -2976,7 +2976,7 @@ static void RSProbeStopTimer(void) {
 //     永不允许 accessory 源视图 / accessory 叶子当宿主。
 // ============================================================================
 
-static UIWindow *RSV633OverlayWindow = nil;
+// RSV633OverlayWindow 已在文件顶部声明（零初始化），这里不再重复定义。
 static BOOL RSV633OverlayFailed = NO;
 static NSTimeInterval RSV633LastLog = 0;
 static CGRect RSV633LastAnchor = CGRectZero;
