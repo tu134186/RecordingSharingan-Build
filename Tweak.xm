@@ -413,6 +413,9 @@ static void RSV73RestoreNativeIndicator(void);
 static void RSV633TeardownOverlay(void);
 static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow);
 static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow);
+static void RSV634ResetFollowState(void);
+static void RSV633ResetLookupCache(void);
+static CGRect RSV634PresentationScreenRect(UIView *v);
 
 static void RSStartRotation(UIView *view) {
     if (!view) return;
@@ -2967,6 +2970,7 @@ static NSTimeInterval RSV633LastLog = 0;
 static CGRect RSV633LastAnchor = CGRectZero;
 static NSTimeInterval RSV633LastAnchorAt = 0;
 static const CGFloat RSV633OverlayLevel = 3500.0;
+static BOOL RSV633LastSideRight = NO;
 
 // 只负责显示，不参与交互：hitTest 一律返回 nil，岛的点击/滑动全部透传给系统。
 @interface RSV633PassthroughWindow : UIWindow
@@ -3024,6 +3028,8 @@ static void RSV633TeardownOverlay(void) {
     RSV633OverlayWindow = nil;
     RSV633LastAnchor = CGRectZero;
     RSV633LastAnchorAt = 0;
+    RSV634ResetFollowState();
+    RSV633ResetLookupCache();
     if (!w) return;
     @try {
         w.hidden = YES;
@@ -3032,18 +3038,43 @@ static void RSV633TeardownOverlay(void) {
     } @catch (...) {}
 }
 
-// 录屏元素所在的药丸（SBSystemApertureContainerView）。找不到时按屏幕交叉再找一次。
+// ---- 6.34 查找缓存 ----------------------------------------------------------
+// CADisplayLink 每帧都会调到这里。RSV633PillForElement / RSV633AccessoryPortalForElement
+// 原本各自要遍历上千个视图，morph 时找不到还要再全树扫一遍 —— 每帧这样扫会掉帧，
+// 表现就是"素材跟不上岛"。这里给两者加弱引用缓存 + 限频全树扫描。
+static __weak UIView *RSV633CachedPill = nil;
+static __weak UIView *RSV633CachedPortal = nil;
+static NSTimeInterval RSV633PillScanAt = 0;
+static NSTimeInterval RSV633PortalScanAt = 0;
+
+static BOOL RSV633Live(UIView *v, CGFloat minSide, CGFloat maxSide) {
+    if (!v || !v.window || v.hidden || v.alpha <= 0.01) return NO;
+    CGRect r = RSV634PresentationScreenRect(v);
+    if (CGRectIsEmpty(r)) return NO;
+    CGFloat w = r.size.width, h = r.size.height;
+    return (w >= minSide && h >= minSide && w <= maxSide && h <= maxSide);
+}
+
+// 录屏元素所在的药丸（SBSystemApertureContainerView）。缓存优先，全树扫描 0.30s 限一次。
 static UIView *RSV633PillForElement(UIView *element) {
     if (!element) return nil;
+    if (RSV633Live(RSV633CachedPill, 8.0, 520.0)) return RSV633CachedPill;
+
+    // 向上找祖先：几乎总是命中，且非常便宜。
     NSInteger hops = 0;
     for (UIView *p = element.superview; p && hops++ < 12; p = p.superview) {
-        if (RSV622ClassHas(p, @"SBSystemApertureContainerView")) {
-            CGRect r = RSV622ScreenRect(p);
-            if (!CGRectIsEmpty(r) && CGRectGetHeight(r) >= 16.0) return p;
+        if (RSV622ClassHas(p, @"SBSystemApertureContainerView") && RSV633Live(p, 8.0, 520.0)) {
+            RSV633CachedPill = p;
+            return p;
         }
     }
-    CGRect er = RSV622ScreenRect(element);
-    if (CGRectIsEmpty(er)) return nil;
+
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - RSV633PillScanAt < 0.30 && RSV633CachedPill) return RSV633CachedPill;
+    RSV633PillScanAt = now;
+
+    CGRect er = RSV634PresentationScreenRect(element);
+    if (CGRectIsEmpty(er)) return RSV633CachedPill;
     CGRect probe = CGRectInset(er, -60.0, -60.0);
     UIView *best = nil;
     CGFloat bestH = 0.0;
@@ -3056,7 +3087,7 @@ static UIView *RSV633PillForElement(UIView *element) {
             [stack removeLastObject];
             if (!v) continue;
             if (v.window && RSV622ClassHas(v, @"SBSystemApertureContainerView")) {
-                CGRect r = RSV622ScreenRect(v);
+                CGRect r = RSV634PresentationScreenRect(v);
                 if (!CGRectIsEmpty(r) && CGRectIntersectsRect(r, probe) &&
                     CGRectGetHeight(r) >= 16.0 && CGRectGetHeight(r) > bestH) {
                     bestH = CGRectGetHeight(r);
@@ -3066,14 +3097,34 @@ static UIView *RSV633PillForElement(UIView *element) {
             for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
         }
     }
-    return best;
+    if (best) RSV633CachedPill = best;
+    return best ?: RSV633CachedPill;
 }
 
 // 录屏元素真正「画出来」的那片 Portal 叶子（红点就在它里面被镜像显示）。
 static UIView *RSV633AccessoryPortalForElement(UIView *element) {
+    if (!element) return nil;
+    if (RSV633Live(RSV633CachedPortal, 6.0, 80.0)) return RSV633CachedPortal;
+
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - RSV633PortalScanAt < 0.20 && RSV633CachedPortal) return RSV633CachedPortal;
+    RSV633PortalScanAt = now;
+
     UIView *best = RSV711BestAccessoryHostForElement(element);
-    if (best && RSV711IsAccessoryPortal(best) && best.window) return best;
-    return nil;
+    if (best && RSV711IsAccessoryPortal(best) && RSV633Live(best, 6.0, 80.0)) {
+        RSV633CachedPortal = best;
+        return best;
+    }
+    // RSV711BestAccessoryHostForElement 正常情况下就会优先返回 portal；
+    // 它没返回 portal 说明这一刻确实没有（morph 重建中），直接返回 nil 让上层沿用上次锚点。
+    return RSV633CachedPortal;
+}
+
+static void RSV633ResetLookupCache(void) {
+    RSV633CachedPill = nil;
+    RSV633CachedPortal = nil;
+    RSV633PillScanAt = 0;
+    RSV633PortalScanAt = 0;
 }
 
 // 岛在屏幕上的可见矩形：药丸优先，其次元素本身。
@@ -3089,49 +3140,176 @@ static CGRect RSV633IslandScreenRect(UIView *element, BOOL *outWide, UIView **ou
     return r;
 }
 
-// 宽岛里红点在两端之一；独立圆岛在正中。返回素材应该覆盖的那个点（屏幕坐标）。
-static CGPoint RSV633AnchorPoint(UIView *element, BOOL *outRight, BOOL *outFromPortal, UIWindow **outWindow) {
+// ============================================================================
+// V7.11.9.4.3.2.6.34 —— 跟随系统形变（presentation 同步 + 锚点记忆 + 侧别迟滞）
+//
+// 6.33 能挂上了，但 morph 时素材「快了 / 慢了 / 乱跳」，三个原因都在日志和逐帧里：
+//   1) RSV622ScreenRect 读的是 layer 的 model frame。系统 morph 时 model 已经是终值，
+//      屏幕上还在 presentation 动画里爬 —— 素材提前到终点，收尾又不动，看着就是「快了/慢了」。
+//   2) morph 中 accessory Portal 会瞬间为空，代码退化成「岛中心推算」，而内缩量用
+//      island.h/2：展开态 h=62.7 → 内缩 31.3 → 算出 175.7，真实红点在 143.8，
+//      素材直接窜到岛中间（日志 00:37:08 / 00:39:34 / 00:39:41）。
+//   3) 侧别在 morph 中一秒翻好几次（00:39:42 right → :43 left → :45 right），
+//      尺寸 31↔37 硬跳，X 偏移跟着换边。
+//
+// 6.34：几何全部改读 presentationLayer（与系统动画同一帧的值），portal 缺失时
+// 沿用上一次锚点而不是去猜，侧别与尺寸加迟滞，morph 期间不隐藏素材。
+// ============================================================================
+
+// 屏幕上**正在显示**的矩形：读 presentationLayer，和系统动画同帧。
+static CGRect RSV634PresentationScreenRect(UIView *v) {
+    if (!v || !v.window) return CGRectZero;
+    @try {
+        CALayer *pl = (CALayer *)v.layer.presentationLayer;
+        CALayer *wl = (CALayer *)v.window.layer.presentationLayer;
+        if (pl && wl) {
+            CGRect b = pl.bounds;
+            CGPoint p1 = [pl convertPoint:CGPointMake(CGRectGetMinX(b), CGRectGetMinY(b)) toLayer:wl];
+            CGPoint p2 = [pl convertPoint:CGPointMake(CGRectGetMaxX(b), CGRectGetMaxY(b)) toLayer:wl];
+            if (isfinite(p1.x) && isfinite(p1.y) && isfinite(p2.x) && isfinite(p2.y)) {
+                CGRect r = CGRectMake(MIN(p1.x, p2.x), MIN(p1.y, p2.y),
+                                      fabs(p2.x - p1.x), fabs(p2.y - p1.y));
+                if (r.size.width >= 0.5 && r.size.height >= 0.5) return r;
+            }
+        }
+    } @catch (...) {}
+    return RSV622ScreenRect(v);
+}
+
+// 侧别迟滞：morph 中 portal 会被重建，位置在两端之间来回报告；
+// 连续 0.26s 都是新侧别才真正切换，避免素材横跳。
+static CGFloat RSV634LastSize = 0;
+static BOOL RSV634SideLast = NO;
+static BOOL RSV634SidePending = NO;
+static BOOL RSV634SideInit = NO;
+static NSTimeInterval RSV634SidePendingAt = 0;
+
+static BOOL RSV634SideHysteresis(BOOL wanted) {
+    NSTimeInterval now = CACurrentMediaTime();
+    if (!RSV634SideInit) {
+        RSV634SideInit = YES;
+        RSV634SideLast = wanted;
+        RSV634SidePending = wanted;
+        RSV634SidePendingAt = 0;
+        return RSV634SideLast;
+    }
+    if (wanted == RSV634SideLast) {
+        RSV634SidePending = wanted;
+        RSV634SidePendingAt = 0;
+        return RSV634SideLast;
+    }
+    if (RSV634SidePending != wanted || RSV634SidePendingAt <= 0) {
+        RSV634SidePending = wanted;
+        RSV634SidePendingAt = now;
+        return RSV634SideLast;
+    }
+    if (now - RSV634SidePendingAt >= 0.26) {
+        RSV634SideLast = wanted;
+        RSV634SidePendingAt = 0;
+        return RSV634SideLast;
+    }
+    return RSV634SideLast;
+}
+
+static void RSV634ResetFollowState(void) {
+    RSV634LastSize = 0;
+    RSV634SideInit = NO;
+    RSV634SideLast = NO;
+    RSV634SidePending = NO;
+    RSV634SidePendingAt = 0;
+}
+
+// 岛在屏幕上「正在显示」的矩形（presentation），以及是否宽岛。
+static CGRect RSV634IslandPresentationRect(UIView *element, BOOL *outWide, UIView **outPill) {
+    UIView *pill = RSV633PillForElement(element);
+    CGRect r = pill ? RSV634PresentationScreenRect(pill) : CGRectZero;
+    if (CGRectIsEmpty(r) || CGRectGetHeight(r) < 8.0) {
+        r = RSV634PresentationScreenRect(element);
+        pill = nil;
+    }
+    if (outPill) *outPill = pill;
+    if (outWide) *outWide = (!CGRectIsEmpty(r) && CGRectGetWidth(r) > CGRectGetHeight(r) * 1.6);
+    return r;
+}
+
+// 尺寸稳定：morph 中岛高在 36.67~38 之间抖，min(设置, 岛高) 会跟着抖 0.3~1pt，
+// 肉眼看是"素材在呼吸"。小于 0.8pt 的变化直接忽略。
+static CGFloat RSV634StableSize(CGFloat wanted) {
+    if (RSV634LastSize <= 0.1) { RSV634LastSize = wanted; return wanted; }
+    if (fabs(wanted - RSV634LastSize) < 0.8) return RSV634LastSize;
+    RSV634LastSize = wanted;
+    return wanted;
+}
+
+// 紧凑态圆的半径：红点/内容圆永远是 36.67 的圆，展开只是长条变高，
+// 所以内缩量绝不能拿当前 island 高度的一半去算。
+static CGFloat RSV634CompactRadius(CGRect island) {
+    CGFloat h = CGRectGetHeight(island);
+    if (h > 8.0 && h < 44.0) return h / 2.0;
+    return 18.3333;
+}
+// 锚点求解（6.34）：全部基于 presentation 几何。
+//   · Portal 可见 → 直接照抄它的 presentation 中心（最准，红点就在里面）
+//   · Portal 缺失 → 1.2 秒内沿用上一次成功锚点与侧别（morph 重建期间绝不乱猜）
+//   · 超过 1.2 秒 → 按当前 island 推算，内缩量用紧凑态圆半径
+static CGPoint RSV634AnchorPoint(UIView *element, BOOL *outRight, BOOL *outFromPortal,
+                                 UIWindow **outWindow, CGRect *outIsland) {
     CGPoint p = CGPointZero;
-    BOOL right = RSVisualSideRight;
     BOOL fromPortal = NO;
     UIWindow *srcWindow = element.window;
+    CGFloat midScreen = CGRectGetMidX([UIScreen mainScreen].bounds);
+
+    UIView *pill = nil;
+    BOOL wide = NO;
+    CGRect island = RSV634IslandPresentationRect(element, &wide, &pill);
+    if (outIsland) *outIsland = island;
 
     UIView *portal = RSV633AccessoryPortalForElement(element);
-    CGRect portalRect = portal ? RSV622ScreenRect(portal) : CGRectZero;
-    BOOL wide = NO;
-    UIView *pill = nil;
-    CGRect island = RSV633IslandScreenRect(element, &wide, &pill);
+    CGRect portalRect = portal ? RSV634PresentationScreenRect(portal) : CGRectZero;
 
     if (!CGRectIsEmpty(portalRect) && CGRectGetWidth(portalRect) >= 6.0 && CGRectGetHeight(portalRect) >= 6.0) {
-        // Portal 就是系统画红点的那块，中心直接照抄 —— 最可靠。
         p = CGPointMake(CGRectGetMidX(portalRect), CGRectGetMidY(portalRect));
-        right = CGRectGetMidX(portalRect) > CGRectGetMidX([UIScreen mainScreen].bounds);
         fromPortal = YES;
         if (portal.window) srcWindow = portal.window;
-    } else if (!CGRectIsEmpty(island)) {
-        if (wide) {
-            CGFloat half = CGRectGetHeight(island) / 2.0;
-            p = CGPointMake(right ? (CGRectGetMaxX(island) - half) : (CGRectGetMinX(island) + half),
-                            CGRectGetMidY(island));
-        } else {
-            p = CGPointMake(CGRectGetMidX(island), CGRectGetMidY(island));
+        RSV633LastAnchor = CGRectMake(p.x - 1.0, p.y - 1.0, 2.0, 2.0);
+        RSV633LastAnchorAt = CACurrentMediaTime();
+        RSV633LastSideRight = (p.x > midScreen);
+    } else {
+        NSTimeInterval now = CACurrentMediaTime();
+        if (!CGRectIsEmpty(RSV633LastAnchor) && (now - RSV633LastAnchorAt) < 1.2) {
+            // morph 重建 portal 的瞬间：素材停在原处，等新 portal 出来。
+            p = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
+            fromPortal = YES;   // 视为已锁定，不触发隐藏
+        } else if (!CGRectIsEmpty(island)) {
+            CGFloat r = RSV634CompactRadius(island);
+            if (!wide) {
+                p = CGPointMake(CGRectGetMidX(island), CGRectGetMidY(island));
+            } else {
+                p = CGPointMake(RSV633LastSideRight ? (CGRectGetMaxX(island) - r)
+                                                    : (CGRectGetMinX(island) + r),
+                                CGRectGetMidY(island));
+            }
+            RSV633LastAnchor = CGRectMake(p.x - 1.0, p.y - 1.0, 2.0, 2.0);
+            RSV633LastAnchorAt = now;
         }
     }
 
-    if (outRight) *outRight = right;
+    // 侧别：portal 存在时上面已把 RSV633LastSideRight 更新成它的真实位置；
+    // portal 缺失时保持上一次。迟滞再把 morph 期间的抖动抹平。
+    BOOL wanted = RSV633LastSideRight;
+    if (outRight) *outRight = RSV634SideHysteresis(wanted);
     if (outFromPortal) *outFromPortal = fromPortal;
     if (outWindow) *outWindow = srcWindow;
     return p;
 }
 
-// 路径 A：覆盖层窗口挂载。不碰系统视图树，只读几何。
+// 路径 A（6.34）：覆盖层窗口。几何全部来自 presentation，每帧贴到系统当前真实位置。
 static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     UIImageView *eye = RSSharinganView;
     if (!eye || !element || !element.window) return NO;
 
     UIWindow *overlay = RSV633EnsureOverlay(element);
     if (!overlay) return NO;
-    if (!overlay.hidden && overlay.frame.size.width < 1.0) overlay.hidden = NO;
     @try {
         CGRect sb = [UIScreen mainScreen].bounds;
         if (!CGRectEqualToRect(overlay.frame, sb)) overlay.frame = sb;
@@ -3140,23 +3318,19 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     BOOL right = RSVisualSideRight;
     BOOL fromPortal = NO;
     UIWindow *anchorWindow = element.window;
-    CGPoint anchor = RSV633AnchorPoint(element, &right, &fromPortal, &anchorWindow);
+    CGRect island = CGRectZero;
+    CGPoint anchor = RSV634AnchorPoint(element, &right, &fromPortal, &anchorWindow, &island);
     if (anchor.x <= 0.0 && anchor.y <= 0.0) {
-        // 岛这一刻可能正在 morph 到没有几何的中间态：沿用 0.6s 内的上一次锚点。
         NSTimeInterval now = CACurrentMediaTime();
-        if (!CGRectIsEmpty(RSV633LastAnchor) && (now - RSV633LastAnchorAt) < 0.6) {
+        if (!CGRectIsEmpty(RSV633LastAnchor) && (now - RSV633LastAnchorAt) < 1.2) {
             anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
             fromPortal = YES;
         } else {
             eye.hidden = YES;
             return YES; // 已接管（不落回旧路径），只是暂时没有可用锚点
         }
-    } else {
-        RSV633LastAnchor = CGRectMake(anchor.x - 1.0, anchor.y - 1.0, 2.0, 2.0);
-        RSV633LastAnchorAt = CACurrentMediaTime();
     }
 
-    // 侧别决定素材、尺寸与左右 X 偏移；红点位置（Portal）优先。
     RSVisualSideRight = right;
     RSLastWasRight = right;
     RSSessionSideLocked = YES;
@@ -3166,15 +3340,11 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     RSRightTransitionSuppressedAt = 0;
     RSRightForceAnchorUntil = 0;
 
-    UIView *pill = nil;
-    BOOL wide = NO;
-    CGRect island = RSV633IslandScreenRect(element, &wide, &pill);
-
     CGFloat configured = right ? RSRightSize() : RSLeftSize();
     CGFloat islandH = CGRectGetHeight(island);
-    // 用户要求「素材放到最大 = 系统独立岛那个圆的直径」：按岛高 clamp，不按宿主。
     if (islandH > 8.0 && configured > islandH) configured = islandH;
     if (configured < 2.0) configured = 31.0;
+    configured = RSV634StableSize(configured);
 
     CGPoint center = RSV622WindowPointToView(anchor, overlay, anchorWindow ?: element.window);
     center.x += right ? RSRightXOffset() : RSLeftXOffset();
@@ -3183,20 +3353,28 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     if (eye.superview != overlay) {
         [eye removeFromSuperview];
         [overlay addSubview:eye];
+    } else {
+        [overlay bringSubviewToFront:eye];
     }
-    [overlay bringSubviewToFront:eye];
     RSEyeHostElement = (UIView *)overlay;
     RSApplyMaterialForSide(eye, right);
-    [UIView performWithoutAnimation:^{
-        eye.bounds = CGRectMake(0, 0, configured, configured);
-        eye.center = center;
-    }];
+
+    // 只在真的变了才写 frame：morph 期间每帧都变，但静止时不要无谓触发 layout。
+    CGRect want = CGRectMake(center.x - configured / 2.0, center.y - configured / 2.0, configured, configured);
+    if (!CGRectEqualToRect(eye.frame, want)) {
+        [UIView performWithoutAnimation:^{
+            eye.bounds = CGRectMake(0, 0, configured, configured);
+            eye.center = center;
+        }];
+    }
 
     BOOL visible = allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending;
     if (visible) { eye.hidden = NO; eye.alpha = 1.0; }
 
-    // 素材盖住之后，把这块 Portal 里仍然露出来的原生红点压成透明（受「隐藏系统红点」开关控制）。
-    if (visible && RSHideNativeRedEnabled() && fromPortal) {
+    static NSTimeInterval lastDotSync = 0;
+    NSTimeInterval nowDot = CACurrentMediaTime();
+    if (visible && RSHideNativeRedEnabled() && fromPortal && (nowDot - lastDotSync) > 0.40) {
+        lastDotSync = nowDot;
         UIView *portalView = RSV633AccessoryPortalForElement(element);
         if (portalView) {
             for (UIView *leaf in RSV622RedLeafDots(portalView)) {
@@ -3220,20 +3398,22 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     return YES;
 }
 
-// 路径 B：覆盖层不可用时，按 6.20 的顺序挂 Portal → 药丸 → 元素。
-// 永不使用 SBSystemApertureSceneElementAccessoryView（26x22 内容源）当宿主。
+// 路径 B（6.34）：覆盖层不可用时，Portal → 药丸 → 元素，几何同样走 presentation。
 static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow) {
     UIImageView *eye = RSSharinganView;
     if (!eye || !element || !element.window) return NO;
 
     BOOL right = RSVisualSideRight;
+    BOOL fromPortal = NO;
     UIWindow *anchorWindow = element.window;
-    CGPoint anchor = RSV633AnchorPoint(element, &right, NULL, &anchorWindow);
-    CGRect island = RSV633IslandScreenRect(element, NULL, NULL);
+    CGRect island = CGRectZero;
+    CGPoint anchor = RSV634AnchorPoint(element, &right, &fromPortal, &anchorWindow, &island);
+
     CGFloat configured = right ? RSRightSize() : RSLeftSize();
     CGFloat islandH = CGRectGetHeight(island);
     if (islandH > 8.0 && configured > islandH) configured = islandH;
     if (configured < 2.0) configured = 31.0;
+    configured = RSV634StableSize(configured);
 
     UIView *host = RSV633AccessoryPortalForElement(element);
     NSString *reason = @"portal";
@@ -3245,7 +3425,8 @@ static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow) {
     if (!host) return NO;
 
     if (anchor.x <= 0.0 && anchor.y <= 0.0) {
-        anchor = CGPointMake(CGRectGetMidX(RSV622ScreenRect(host)), CGRectGetMidY(RSV622ScreenRect(host)));
+        CGRect hr = RSV634PresentationScreenRect(host);
+        anchor = CGPointMake(CGRectGetMidX(hr), CGRectGetMidY(hr));
     }
 
     RSVisualSideRight = right;
@@ -3260,18 +3441,22 @@ static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow) {
     if (eye.superview != host) {
         [eye removeFromSuperview];
         [host addSubview:eye];
+    } else {
+        [host bringSubviewToFront:eye];
     }
-    [host bringSubviewToFront:eye];
     RSEyeHostElement = host;
     RSApplyMaterialForSide(eye, right);
 
     CGPoint center = RSV622WindowPointToView(anchor, host, anchorWindow ?: element.window);
     center.x += right ? RSRightXOffset() : RSLeftXOffset();
     center.y += RSYOffset();
-    [UIView performWithoutAnimation:^{
-        eye.bounds = CGRectMake(0, 0, configured, configured);
-        eye.center = center;
-    }];
+    CGRect want = CGRectMake(center.x - configured / 2.0, center.y - configured / 2.0, configured, configured);
+    if (!CGRectEqualToRect(eye.frame, want)) {
+        [UIView performWithoutAnimation:^{
+            eye.bounds = CGRectMake(0, 0, configured, configured);
+            eye.center = center;
+        }];
+    }
 
     BOOL visible = allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending;
     if (visible) { eye.hidden = NO; eye.alpha = 1.0; }
@@ -3284,6 +3469,7 @@ static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow) {
     }
     return YES;
 }
+
 static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     if (!RSRecordingActive || RSCaptureStopPending || ![UIScreen mainScreen].isCaptured) return;
     if (!RSEyeMountedInElement || !RSEyeMountedElement || RSEyeMountedElement != element) return;
