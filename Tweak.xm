@@ -415,8 +415,8 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow);
 static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow);
 static void RSV634ResetFollowState(void);
 static void RSV633ResetLookupCache(void);
-static void RSV637ResetFollow(void);
 static CGRect RSV634PresentationScreenRect(UIView *v);
+static UIWindow *RSV633OverlayWindow;
 
 static void RSStartRotation(UIView *view) {
     if (!view) return;
@@ -451,6 +451,17 @@ static void RSSuppressNativeRedDuringRightHandoff(NSUInteger generation, NSUInte
 static void RSPauseEyeForCaptureGrace(void) {
     UIImageView *eye = RSSharinganView;
     if (!eye || RSEyeGracePaused) return;
+    // 6.38：覆盖层是独立窗口，morph 期间系统报 capture-off 也与我们无关。
+    // 这里直接不隐藏也不冻结 —— 实测那正是「变形时素材闪一下」的来源。
+    if (RSV633OverlayWindow && eye.superview == (UIView *)RSV633OverlayWindow) {
+        static NSTimeInterval lastSkipLog = 0;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastSkipLog > 1.0) {
+            lastSkipLog = now;
+            RSLog(@"6.38 capture-off grace ignored (overlay host)");
+        }
+        return;
+    }
     CALayer *layer = eye.layer;
     CFTimeInterval pausedTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil];
     layer.speed = 0.0;
@@ -3031,7 +3042,6 @@ static void RSV633TeardownOverlay(void) {
     RSV633LastAnchorAt = 0;
     RSV634ResetFollowState();
     RSV633ResetLookupCache();
-    RSV637ResetFollow();
     if (!w) return;
     @try {
         w.hidden = YES;
@@ -3123,62 +3133,6 @@ static UIView *RSV637PortalInElement(UIView *element) {
     return best;
 }
 
-// 6.37 平滑跟随：把「瞬移」变成「滑动」。
-static CGPoint RSV637FollowPoint = CGPointZero;
-static NSTimeInterval RSV637FollowAt = 0;
-static BOOL RSV637FollowHas = NO;
-
-static void RSV637ResetFollow(void) {
-    RSV637FollowHas = NO;
-    RSV637FollowAt = 0;
-    RSV637FollowPoint = CGPointZero;
-}
-
-// 目标点 → 实际使用的点。逐帧微动直接贴；只有大跳变才插值。
-static CGPoint RSV637Smooth(CGPoint want) {
-    NSTimeInterval now = CACurrentMediaTime();
-    CGFloat dt = (RSV637FollowAt > 0) ? (now - RSV637FollowAt) : 0.016;
-    if (dt <= 0.0 || dt > 0.25) dt = 0.016;
-    RSV637FollowAt = now;
-    if (!RSV637FollowHas) {
-        RSV637FollowHas = YES;
-        RSV637FollowPoint = want;
-        return want;
-    }
-    CGFloat dx = want.x - RSV637FollowPoint.x;
-    CGFloat dy = want.y - RSV637FollowPoint.y;
-    CGFloat dist = hypot(dx, dy);
-    if (dist < 8.0) {
-        // 正常 morph：完全跟随，零滞后。
-        RSV637FollowPoint = want;
-        return want;
-    }
-    // 换岛/换元素的瞬移：35ms 时间常数滑过去（约 120ms 到 95%）。
-    CGFloat k = 1.0 - exp(-dt / 0.035);
-    if (k > 0.92) k = 0.92;
-    RSV637FollowPoint = CGPointMake(RSV637FollowPoint.x + dx * k, RSV637FollowPoint.y + dy * k);
-    return RSV637FollowPoint;
-}
-
-// 岛在整个屏幕上是否还存在（不要求与录屏元素同源）—— 用来区分「morph」与「真的结束」。
-static BOOL RSV637AnyIslandOnScreen(void) {
-    for (UIWindow *w in RSAllApplicationWindows()) {
-        if (!w || w == RSV633OverlayWindow) continue;
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
-        NSInteger guard = 0;
-        while (stack.count && guard++ < 1200) {
-            UIView *v = stack.lastObject;
-            [stack removeLastObject];
-            if (!v) continue;
-            if (v.window && RSV636IsPillClass(v)) {
-                CGRect r = RSV634PresentationScreenRect(v);
-                if (RSV635IslandPlausible(r)) return YES;
-            }
-            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
-        }
-    }
-    return NO;
-}
 // 同时给出「这个录屏元素自己的 Portal」和「它所属的药丸」。
 // 返回 YES 时 portal 与 pill 保证同属一个元素；pill 可能为 nil（只拿到 portal）。
 static BOOL RSV636PortalAndPill(UIView *element, UIView **outPortal, UIView **outPill) {
@@ -3435,6 +3389,25 @@ static BOOL RSV635IslandPlausible(CGRect r) {
     return YES;
 }
 
+// 6.38：素材圆心必须留在岛内。实测出现过素材中心 x=77、岛左缘 72.8 ——
+// 直径 36.7 的圆有一半挂在岛外。这里把圆心夹进岛矩形（水平严格，垂直放宽，
+// 以免用户设置的 Y 偏移被吃掉）。
+static CGPoint RSV638ClampIntoIsland(CGPoint center, CGRect island, CGFloat side) {
+    if (!RSV635IslandPlausible(island)) return center;
+    CGFloat r = side / 2.0;
+    CGFloat minX = CGRectGetMinX(island) + r;
+    CGFloat maxX = CGRectGetMaxX(island) - r;
+    if (maxX < minX) { minX = maxX = CGRectGetMidX(island); }
+    if (center.x < minX) center.x = minX;
+    if (center.x > maxX) center.x = maxX;
+    CGFloat minY = CGRectGetMinY(island) + r - 10.0;
+    CGFloat maxY = CGRectGetMaxY(island) - r + 10.0;
+    if (maxY < minY) { minY = maxY = CGRectGetMidY(island); }
+    if (center.y < minY) center.y = minY;
+    if (center.y > maxY) center.y = maxY;
+    return center;
+}
+
 // 紧凑态圆的半径：红点/内容圆永远是 36.67 的圆，展开只是长条变高，
 // 所以内缩量绝不能拿当前 island 高度的一半去算。
 static CGFloat RSV634CompactRadius(CGRect island) {
@@ -3519,28 +3492,13 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     CGRect island = CGRectZero;
     CGPoint anchor = RSV634AnchorPoint(element, &right, &fromPortal, &anchorWindow, &island);
     if (anchor.x <= 0.0 && anchor.y <= 0.0) {
-        NSTimeInterval now = CACurrentMediaTime();
-        if (!CGRectIsEmpty(RSV633LastAnchor) && (now - RSV633LastAnchorAt) < 1.2) {
+        // 6.38：锚点这一刻读不到（系统正在重建 portal）时，
+        // 什么都不改，保持上一帧的位置和可见性 —— 绝不隐藏。
+        if (!CGRectIsEmpty(RSV633LastAnchor)) {
             anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
             fromPortal = YES;
         } else {
-            // 6.37：morph 期间锚点会短暂空掉。只有「连岛都没有了」才隐藏，
-            // 否则停在最后位置继续显示，避免素材闪一下不见。
-            static NSTimeInterval lastIslandGoneAt = 0;
-            BOOL islandAlive = RSV637AnyIslandOnScreen();
-            if (!islandAlive) {
-                if (lastIslandGoneAt <= 0) lastIslandGoneAt = now;
-                if (now - lastIslandGoneAt > 0.45) { eye.hidden = YES; return YES; }
-            } else {
-                lastIslandGoneAt = 0;
-            }
-            if (!CGRectIsEmpty(RSV633LastAnchor)) {
-                anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
-                fromPortal = YES;
-            } else {
-                eye.hidden = YES;
-                return YES;
-            }
+            return YES;
         }
     }
 
@@ -3562,8 +3520,8 @@ static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
     CGPoint center = RSV622WindowPointToView(anchor, overlay, anchorWindow ?: element.window);
     center.x += right ? RSRightXOffset() : RSLeftXOffset();
     center.y += RSYOffset();
-    // 6.37：换岛时滑过去，不要瞬移。
-    center = RSV637Smooth(center);
+    // 6.38：逐帧直接贴 presentation，不加任何插值；只把圆夹回岛内。
+    center = RSV638ClampIntoIsland(center, island, configured);
 
     if (eye.superview != overlay) {
         [eye removeFromSuperview];
