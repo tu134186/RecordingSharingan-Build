@@ -410,6 +410,9 @@ static void RSSuppressTransientRecordingRedContainers(void);
 static void RSRestoreTransientRedLeaves(void);
 static void RSTestSnapshot(NSString *reason);
 static void RSV73RestoreNativeIndicator(void);
+static void RSV633TeardownOverlay(void);
+static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow);
+static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow);
 
 static void RSStartRotation(UIView *view) {
     if (!view) return;
@@ -634,6 +637,7 @@ static void RSProbeBegin(void);
 static void RSProbeFinish(void);
 
 static void RSRemoveSharingan(void) {
+    RSV633TeardownOverlay();
     RSProbeFinish();
     RSRedSuppressionGeneration++;
     RSV622AnchoredActive = NO;
@@ -2937,12 +2941,360 @@ static void RSProbeStopTimer(void) {
 }
 
 // 位置同步：优先使用系统左右 TransformView 内的 Provided 容器，旧路径仅作兼容回退。
+// ============================================================================
+// V7.11.9.4.3.2.6.33 —— 双路径挂载
+//
+// 6.21~6.32 的教训（真机日志 + 逐帧视频确认）：
+//   素材一律 addSubview 进 SystemAperture 的子树。而那棵树每层都有职责：
+//     · SBSystemApertureSceneElementAccessoryView —— 内容源，只有 26x22，不负责显示；
+//     · ...AccessoryPortalView —— 只做图层镜像，系统会重建，子视图随时丢；
+//     · SBSystemApertureContainerView（药丸）—— 系统自己排布，还有黑色背板压在上面。
+//   往任何一层塞一张比槽位大的图，结果必然是裁掉 / 被背板盖住 / morph 重建时消失。
+//   6.21 起把 hierarchy 路径排在最前面，30 次日志全部选中 accessory 源视图 —— 这就是
+//   「独立岛明明能挂，后面几版一直挂不上」的唯一原因。
+//
+// 6.33 改成两条互不干扰的路径：
+//   A（主）覆盖层窗口：自己开一个 UIWindow（level 3500），只从岛「读」屏幕矩形，
+//     不向岛要父子关系。裁剪、背板、z 序、morph 重建全部与我们无关；素材尺寸按
+//     岛高 clamp，不再被 26x22 的宿主压小。
+//   B（兜底）Portal 叶子：覆盖层建不出来时才用，按 6.20 的顺序 Portal → 药丸 → 元素，
+//     永不允许 accessory 源视图 / accessory 叶子当宿主。
+// ============================================================================
+
+static UIWindow *RSV633OverlayWindow = nil;
+static BOOL RSV633OverlayFailed = NO;
+static NSTimeInterval RSV633LastLog = 0;
+static CGRect RSV633LastAnchor = CGRectZero;
+static NSTimeInterval RSV633LastAnchorAt = 0;
+static const CGFloat RSV633OverlayLevel = 3500.0;
+
+// 只负责显示，不参与交互：hitTest 一律返回 nil，岛的点击/滑动全部透传给系统。
+@interface RSV633PassthroughWindow : UIWindow
+@end
+@implementation RSV633PassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { return NO; }
+@end
+
+static UIWindowScene *RSV633BestWindowScene(UIView *element) {
+    UIWindowScene *fromElement = nil;
+    @try { fromElement = element.window.windowScene; } @catch (...) { fromElement = nil; }
+    if (fromElement) return fromElement;
+    UIWindowScene *fallback = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        if (!fallback) fallback = ws;
+        if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
+    }
+    return fallback;
+}
+
+// 覆盖层窗口：全屏、透明、不拦触摸。建不出来就永久记失败，之后走路径 B。
+static UIWindow *RSV633EnsureOverlay(UIView *element) {
+    if (RSV633OverlayWindow) return RSV633OverlayWindow;
+    if (RSV633OverlayFailed) return nil;
+    UIWindowScene *scene = RSV633BestWindowScene(element);
+    if (!scene) { RSV633OverlayFailed = YES; RSLog(@"[V6.33] overlay: no window scene"); return nil; }
+    @try {
+        RSV633PassthroughWindow *w = [[RSV633PassthroughWindow alloc] initWithWindowScene:scene];
+        w.frame = [UIScreen mainScreen].bounds;
+        w.windowLevel = RSV633OverlayLevel;
+        w.backgroundColor = [UIColor clearColor];
+        w.opaque = NO;
+        w.hidden = NO;
+        w.alpha = 1.0;
+        w.userInteractionEnabled = NO;
+        w.rootViewController = [[UIViewController alloc] init];
+        w.rootViewController.view.backgroundColor = [UIColor clearColor];
+        w.rootViewController.view.userInteractionEnabled = NO;
+        RSV633OverlayWindow = w;
+        RSLog(@"[V6.33] overlay ready scene=%@ level=%.0f frame=%@",
+              NSStringFromClass(scene.class), RSV633OverlayLevel, NSStringFromCGRect(w.frame));
+    } @catch (NSException *e) {
+        RSV633OverlayFailed = YES;
+        RSV633OverlayWindow = nil;
+        RSLog(@"[V6.33] overlay failed: %@", e);
+    }
+    return RSV633OverlayWindow;
+}
+
+static void RSV633TeardownOverlay(void) {
+    UIWindow *w = RSV633OverlayWindow;
+    RSV633OverlayWindow = nil;
+    RSV633LastAnchor = CGRectZero;
+    RSV633LastAnchorAt = 0;
+    if (!w) return;
+    @try {
+        w.hidden = YES;
+        w.rootViewController = nil;
+        for (UIView *sub in [w.subviews copy]) [sub removeFromSuperview];
+    } @catch (...) {}
+}
+
+// 录屏元素所在的药丸（SBSystemApertureContainerView）。找不到时按屏幕交叉再找一次。
+static UIView *RSV633PillForElement(UIView *element) {
+    if (!element) return nil;
+    NSInteger hops = 0;
+    for (UIView *p = element.superview; p && hops++ < 12; p = p.superview) {
+        if (RSV622ClassHas(p, @"SBSystemApertureContainerView")) {
+            CGRect r = RSV622ScreenRect(p);
+            if (!CGRectIsEmpty(r) && CGRectGetHeight(r) >= 16.0) return p;
+        }
+    }
+    CGRect er = RSV622ScreenRect(element);
+    if (CGRectIsEmpty(er)) return nil;
+    CGRect probe = CGRectInset(er, -60.0, -60.0);
+    UIView *best = nil;
+    CGFloat bestH = 0.0;
+    for (UIWindow *w in RSAllApplicationWindows()) {
+        if (!w || w == RSV633OverlayWindow) continue;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        NSInteger guard = 0;
+        while (stack.count && guard++ < 1500) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (!v) continue;
+            if (v.window && RSV622ClassHas(v, @"SBSystemApertureContainerView")) {
+                CGRect r = RSV622ScreenRect(v);
+                if (!CGRectIsEmpty(r) && CGRectIntersectsRect(r, probe) &&
+                    CGRectGetHeight(r) >= 16.0 && CGRectGetHeight(r) > bestH) {
+                    bestH = CGRectGetHeight(r);
+                    best = v;
+                }
+            }
+            for (UIView *sub in [v.subviews copy]) if (sub) [stack addObject:sub];
+        }
+    }
+    return best;
+}
+
+// 录屏元素真正「画出来」的那片 Portal 叶子（红点就在它里面被镜像显示）。
+static UIView *RSV633AccessoryPortalForElement(UIView *element) {
+    UIView *best = RSV711BestAccessoryHostForElement(element);
+    if (best && RSV711IsAccessoryPortal(best) && best.window) return best;
+    return nil;
+}
+
+// 岛在屏幕上的可见矩形：药丸优先，其次元素本身。
+static CGRect RSV633IslandScreenRect(UIView *element, BOOL *outWide, UIView **outPill) {
+    UIView *pill = RSV633PillForElement(element);
+    CGRect r = pill ? RSV622ScreenRect(pill) : CGRectZero;
+    if (CGRectIsEmpty(r)) {
+        r = RSV622ScreenRect(element);
+        pill = nil;
+    }
+    if (outPill) *outPill = pill;
+    if (outWide) *outWide = (!CGRectIsEmpty(r) && CGRectGetWidth(r) > CGRectGetHeight(r) * 1.6);
+    return r;
+}
+
+// 宽岛里红点在两端之一；独立圆岛在正中。返回素材应该覆盖的那个点（屏幕坐标）。
+static CGPoint RSV633AnchorPoint(UIView *element, BOOL *outRight, BOOL *outFromPortal, UIWindow **outWindow) {
+    CGPoint p = CGPointZero;
+    BOOL right = RSVisualSideRight;
+    BOOL fromPortal = NO;
+    UIWindow *srcWindow = element.window;
+
+    UIView *portal = RSV633AccessoryPortalForElement(element);
+    CGRect portalRect = portal ? RSV622ScreenRect(portal) : CGRectZero;
+    BOOL wide = NO;
+    UIView *pill = nil;
+    CGRect island = RSV633IslandScreenRect(element, &wide, &pill);
+
+    if (!CGRectIsEmpty(portalRect) && CGRectGetWidth(portalRect) >= 6.0 && CGRectGetHeight(portalRect) >= 6.0) {
+        // Portal 就是系统画红点的那块，中心直接照抄 —— 最可靠。
+        p = CGPointMake(CGRectGetMidX(portalRect), CGRectGetMidY(portalRect));
+        right = CGRectGetMidX(portalRect) > CGRectGetMidX([UIScreen mainScreen].bounds);
+        fromPortal = YES;
+        if (portal.window) srcWindow = portal.window;
+    } else if (!CGRectIsEmpty(island)) {
+        if (wide) {
+            CGFloat half = CGRectGetHeight(island) / 2.0;
+            p = CGPointMake(right ? (CGRectGetMaxX(island) - half) : (CGRectGetMinX(island) + half),
+                            CGRectGetMidY(island));
+        } else {
+            p = CGPointMake(CGRectGetMidX(island), CGRectGetMidY(island));
+        }
+    }
+
+    if (outRight) *outRight = right;
+    if (outFromPortal) *outFromPortal = fromPortal;
+    if (outWindow) *outWindow = srcWindow;
+    return p;
+}
+
+// 路径 A：覆盖层窗口挂载。不碰系统视图树，只读几何。
+static BOOL RSV633OverlayPlaceEye(UIView *element, BOOL allowShow) {
+    UIImageView *eye = RSSharinganView;
+    if (!eye || !element || !element.window) return NO;
+
+    UIWindow *overlay = RSV633EnsureOverlay(element);
+    if (!overlay) return NO;
+    if (!overlay.hidden && overlay.frame.size.width < 1.0) overlay.hidden = NO;
+    @try {
+        CGRect sb = [UIScreen mainScreen].bounds;
+        if (!CGRectEqualToRect(overlay.frame, sb)) overlay.frame = sb;
+    } @catch (...) {}
+
+    BOOL right = RSVisualSideRight;
+    BOOL fromPortal = NO;
+    UIWindow *anchorWindow = element.window;
+    CGPoint anchor = RSV633AnchorPoint(element, &right, &fromPortal, &anchorWindow);
+    if (anchor.x <= 0.0 && anchor.y <= 0.0) {
+        // 岛这一刻可能正在 morph 到没有几何的中间态：沿用 0.6s 内的上一次锚点。
+        NSTimeInterval now = CACurrentMediaTime();
+        if (!CGRectIsEmpty(RSV633LastAnchor) && (now - RSV633LastAnchorAt) < 0.6) {
+            anchor = CGPointMake(CGRectGetMidX(RSV633LastAnchor), CGRectGetMidY(RSV633LastAnchor));
+            fromPortal = YES;
+        } else {
+            eye.hidden = YES;
+            return YES; // 已接管（不落回旧路径），只是暂时没有可用锚点
+        }
+    } else {
+        RSV633LastAnchor = CGRectMake(anchor.x - 1.0, anchor.y - 1.0, 2.0, 2.0);
+        RSV633LastAnchorAt = CACurrentMediaTime();
+    }
+
+    // 侧别决定素材、尺寸与左右 X 偏移；红点位置（Portal）优先。
+    RSVisualSideRight = right;
+    RSLastWasRight = right;
+    RSSessionSideLocked = YES;
+    RSSessionLockedRight = right;
+    RSRightTransitionSuppressed = NO;
+    RSRightTransitionStableSince = 0;
+    RSRightTransitionSuppressedAt = 0;
+    RSRightForceAnchorUntil = 0;
+
+    UIView *pill = nil;
+    BOOL wide = NO;
+    CGRect island = RSV633IslandScreenRect(element, &wide, &pill);
+
+    CGFloat configured = right ? RSRightSize() : RSLeftSize();
+    CGFloat islandH = CGRectGetHeight(island);
+    // 用户要求「素材放到最大 = 系统独立岛那个圆的直径」：按岛高 clamp，不按宿主。
+    if (islandH > 8.0 && configured > islandH) configured = islandH;
+    if (configured < 2.0) configured = 31.0;
+
+    CGPoint center = RSV622WindowPointToView(anchor, overlay, anchorWindow ?: element.window);
+    center.x += right ? RSRightXOffset() : RSLeftXOffset();
+    center.y += RSYOffset();
+
+    if (eye.superview != overlay) {
+        [eye removeFromSuperview];
+        [overlay addSubview:eye];
+    }
+    [overlay bringSubviewToFront:eye];
+    RSEyeHostElement = (UIView *)overlay;
+    RSApplyMaterialForSide(eye, right);
+    [UIView performWithoutAnimation:^{
+        eye.bounds = CGRectMake(0, 0, configured, configured);
+        eye.center = center;
+    }];
+
+    BOOL visible = allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending;
+    if (visible) { eye.hidden = NO; eye.alpha = 1.0; }
+
+    // 素材盖住之后，把这块 Portal 里仍然露出来的原生红点压成透明（受「隐藏系统红点」开关控制）。
+    if (visible && RSHideNativeRedEnabled() && fromPortal) {
+        UIView *portalView = RSV633AccessoryPortalForElement(element);
+        if (portalView) {
+            for (UIView *leaf in RSV622RedLeafDots(portalView)) {
+                if (!objc_getAssociatedObject(leaf, RSOriginalAlphaKey))
+                    objc_setAssociatedObject(leaf, RSOriginalAlphaKey, @(leaf.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                leaf.alpha = 0.0;
+                RSV622TrackDot(leaf);
+            }
+        }
+    }
+
+    RSV622AnchoredActive = YES;
+
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - RSV633LastLog > 1.0) {
+        RSV633LastLog = now;
+        RSLog(@"[V6.33] overlay host side=%@ portal=%d island=%@ anchor={%.1f,%.1f} size=%.1f eye=%@",
+              right ? @"right" : @"left", (int)fromPortal, NSStringFromCGRect(island),
+              anchor.x, anchor.y, configured, NSStringFromCGRect(RSV622ScreenRect(eye)));
+    }
+    return YES;
+}
+
+// 路径 B：覆盖层不可用时，按 6.20 的顺序挂 Portal → 药丸 → 元素。
+// 永不使用 SBSystemApertureSceneElementAccessoryView（26x22 内容源）当宿主。
+static BOOL RSV633PortalPlaceEye(UIView *element, BOOL allowShow) {
+    UIImageView *eye = RSSharinganView;
+    if (!eye || !element || !element.window) return NO;
+
+    BOOL right = RSVisualSideRight;
+    UIWindow *anchorWindow = element.window;
+    CGPoint anchor = RSV633AnchorPoint(element, &right, NULL, &anchorWindow);
+    CGRect island = RSV633IslandScreenRect(element, NULL, NULL);
+    CGFloat configured = right ? RSRightSize() : RSLeftSize();
+    CGFloat islandH = CGRectGetHeight(island);
+    if (islandH > 8.0 && configured > islandH) configured = islandH;
+    if (configured < 2.0) configured = 31.0;
+
+    UIView *host = RSV633AccessoryPortalForElement(element);
+    NSString *reason = @"portal";
+    if (!host || !host.window) {
+        UIView *pill = RSV633PillForElement(element);
+        if (pill && pill.window) { host = pill; reason = @"pill"; }
+    }
+    if (!host || !host.window) { host = element; reason = @"element"; }
+    if (!host) return NO;
+
+    if (anchor.x <= 0.0 && anchor.y <= 0.0) {
+        anchor = CGPointMake(CGRectGetMidX(RSV622ScreenRect(host)), CGRectGetMidY(RSV622ScreenRect(host)));
+    }
+
+    RSVisualSideRight = right;
+    RSLastWasRight = right;
+    RSSessionSideLocked = YES;
+    RSSessionLockedRight = right;
+    RSRightTransitionSuppressed = NO;
+    RSRightTransitionStableSince = 0;
+    RSRightTransitionSuppressedAt = 0;
+    RSRightForceAnchorUntil = 0;
+
+    if (eye.superview != host) {
+        [eye removeFromSuperview];
+        [host addSubview:eye];
+    }
+    [host bringSubviewToFront:eye];
+    RSEyeHostElement = host;
+    RSApplyMaterialForSide(eye, right);
+
+    CGPoint center = RSV622WindowPointToView(anchor, host, anchorWindow ?: element.window);
+    center.x += right ? RSRightXOffset() : RSLeftXOffset();
+    center.y += RSYOffset();
+    [UIView performWithoutAnimation:^{
+        eye.bounds = CGRectMake(0, 0, configured, configured);
+        eye.center = center;
+    }];
+
+    BOOL visible = allowShow && !RSEyeGracePaused && !RSEyeResumeVisibilityPending;
+    if (visible) { eye.hidden = NO; eye.alpha = 1.0; }
+
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - RSV633LastLog > 1.0) {
+        RSV633LastLog = now;
+        RSLog(@"[V6.33] portal host reason=%@ class=%@ side=%@ anchor={%.1f,%.1f} size=%.1f",
+              reason, NSStringFromClass(host.class), right ? @"right" : @"left", anchor.x, anchor.y, configured);
+    }
+    return YES;
+}
 static void RSV6SyncEyeToElement(UIView *element, BOOL allowShow) {
     if (!RSRecordingActive || RSCaptureStopPending || ![UIScreen mainScreen].isCaptured) return;
     if (!RSEyeMountedInElement || !RSEyeMountedElement || RSEyeMountedElement != element) return;
     UIImageView *eye = RSSharinganView;
     if (!eye || !element.window) return;
     RSProbeTick(element);
+
+    // V7.11.9.4.3.2.6.33 双路径：A 覆盖层窗口（主，不碰系统视图树）→ B Portal/药丸（兜底）。
+    // 命中即接管，绝不落回 6.21 那条把所有日志都导向 accessory 源视图的 hierarchy 路径。
+    if (RSV633OverlayPlaceEye(element, allowShow)) return;
+    if (RSV633PortalPlaceEye(element, allowShow)) return;
 
     // V7.11.9.4.3.2.6.22：红点锚定优先 —— 素材圆心严格等于系统红点圆心，侧别也照抄红点。
     if (RSV622DotAnchoredPlacement(element, allowShow)) return;
