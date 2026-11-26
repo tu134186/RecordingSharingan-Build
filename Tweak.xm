@@ -3228,6 +3228,20 @@ static CGFloat RSV634StableSize(CGFloat wanted) {
     return wanted;
 }
 
+// morph 过渡帧里 RSV633PillForElement 可能抓到别的视图（日志 00:37:08 那个
+// {144.3,-5.7,141.3x62.7} 就是 y 跑到屏幕外、高度离谱的假岛）。
+// 这种矩形不能拿来推算锚点，否则素材会被拽到岛中间。
+static BOOL RSV635IslandPlausible(CGRect r) {
+    if (CGRectIsEmpty(r)) return NO;
+    CGFloat x = CGRectGetMinX(r), y = CGRectGetMinY(r);
+    CGFloat w = CGRectGetWidth(r), h = CGRectGetHeight(r);
+    if (y < -2.0 || y > 42.0) return NO;
+    if (h < 14.0 || h > 140.0) return NO;
+    if (w < 14.0 || w > 440.0) return NO;
+    if (x < -2.0 || x + w > CGRectGetWidth([UIScreen mainScreen].bounds) + 2.0) return NO;
+    return YES;
+}
+
 // 紧凑态圆的半径：红点/内容圆永远是 36.67 的圆，展开只是长条变高，
 // 所以内缩量绝不能拿当前 island 高度的一半去算。
 static CGFloat RSV634CompactRadius(CGRect island) {
@@ -3249,6 +3263,10 @@ static CGPoint RSV634AnchorPoint(UIView *element, BOOL *outRight, BOOL *outFromP
     UIView *pill = nil;
     BOOL wide = NO;
     CGRect island = RSV634IslandPresentationRect(element, &wide, &pill);
+    if (!RSV635IslandPlausible(island)) {
+        island = CGRectZero;
+        wide = NO;
+    }
     if (outIsland) *outIsland = island;
 
     UIView *portal = RSV633AccessoryPortalForElement(element);
