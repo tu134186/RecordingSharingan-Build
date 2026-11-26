@@ -3127,19 +3127,6 @@ static void RSV633ResetLookupCache(void) {
     RSV633PortalScanAt = 0;
 }
 
-// 岛在屏幕上的可见矩形：药丸优先，其次元素本身。
-static CGRect RSV633IslandScreenRect(UIView *element, BOOL *outWide, UIView **outPill) {
-    UIView *pill = RSV633PillForElement(element);
-    CGRect r = pill ? RSV622ScreenRect(pill) : CGRectZero;
-    if (CGRectIsEmpty(r)) {
-        r = RSV622ScreenRect(element);
-        pill = nil;
-    }
-    if (outPill) *outPill = pill;
-    if (outWide) *outWide = (!CGRectIsEmpty(r) && CGRectGetWidth(r) > CGRectGetHeight(r) * 1.6);
-    return r;
-}
-
 // ============================================================================
 // V7.11.9.4.3.2.6.34 —— 跟随系统形变（presentation 同步 + 锚点记忆 + 侧别迟滞）
 //
